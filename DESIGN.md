@@ -204,13 +204,43 @@ icon's hotspot offset, not mapping error) — alongside a still-healthy,
 independently `ffprobe`-verified video stream. Both the keyboard and
 pointer virtual devices are created and torn down per connection.
 
-Still stubbed: ScreenCaptureKit (macOS
-capture — moot anyway, since macOS is the client-only platform here), and
-client-side decode + `wgpu` render. Real client-side decode is deliberately
-not attempted yet: the target client platform is macOS/VideoToolbox, and
-this environment has no Mac to build or run that against — writing
-VideoToolbox FFI blind, with no way to verify it, isn't worth the risk of a
-confident-looking but untested implementation. The demo client stays on
-`PassthroughCodec` (works identically on any platform, already verified)
-plus a `--dump-raw` escape hatch for inspecting whatever the server
-actually sends with independent tooling, as done above.
+Milestone 5: **real client-side HEVC decode via VideoToolbox**, on the
+actual target hardware (M1 MacBook Air, macOS 15.2) — the piece Milestone
+4's write-up said couldn't responsibly be attempted blind, now built and
+verified for real instead of guessed at. Uses `objc2-video-toolbox` /
+`objc2-core-media` / `objc2-core-video` directly (the same ecosystem `wgpu`
+itself already depends on for macOS/Metal support) rather than the two
+"safe wrapper" crates on crates.io, which turned out on inspection to be
+thin unsafe re-exports of the same C functions with no real abstraction to
+gain from depending on them instead.
+
+Verified against real hardware output, not a hand-crafted fixture: a crate
+test encodes a clip with the real VideoToolbox *hardware encoder*
+(`ffmpeg -c:v hevc_videotoolbox`, confirmed present via Homebrew) and
+decodes it with this module, asserting the right frame count (25/25),
+correct dimensions, and actually non-zero pixel content per frame — not
+just "no error was returned." One real, empirically-confirmed constraint
+surfaced along the way and designed around rather than papered over:
+requesting RGBA as the decode output color-conversion target fails every
+single frame with `kCVReturnInvalidPixelFormat` (-6680); BGRA (the
+platform's native 32-bit order — Metal's usual swapchain format is
+`BGRA8Unorm`, not `RGBA8Unorm`) is what the hardware color-conversion path
+actually supports. Rather than mislabel BGRA output as "RGBA" (a real
+correctness bug a downstream consumer would eventually hit, not a harmless
+simplification), the `Decoder` trait was extended to report the actual
+pixel format and stride, mirroring how `RawFrame` already does this for
+capture.
+
+Still stubbed: ScreenCaptureKit (macOS capture — moot anyway, since macOS
+is the client-only platform here), local input capture from the client's
+own window (mouse/keyboard → `InputEvent`; not `CGEvent` posting, which
+would be for a macOS *server*, out of scope here), and `wgpu` render. The
+demo client now has a real decoder wired up for `VideoCodec::Hevc`
+(macOS) alongside `PassthroughCodec` for the test-pattern path, plus the
+`--dump-raw` escape hatch for inspecting the stream with independent
+tooling when needed. Not yet verified: decoding the server's *actual*
+network-transported HEVC output end-to-end across the real LAN (only
+decode-correctness-in-isolation and encode-correctness-in-isolation are
+proven so far, on their respective machines) — needs the Linux server
+actually running and reachable to close that loop, deliberately not done
+unilaterally this pass.

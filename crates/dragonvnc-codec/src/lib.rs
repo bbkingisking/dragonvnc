@@ -31,13 +31,27 @@ pub trait Encoder: Send {
     }
 }
 
+/// A decoded frame's pixels, tagged with the layout they're actually in.
+/// Real hardware decoders don't all agree on one universal output layout —
+/// e.g. VideoToolbox's HEVC decode path supports BGRA as a hardware
+/// color-conversion target but not RGBA (confirmed empirically: requesting
+/// RGBA fails every frame with `kCVReturnInvalidPixelFormat`, BGRA works).
+/// Mislabeling that as "RGBA" so callers could assume one fixed layout
+/// would be a real correctness bug, not a harmless simplification, so this
+/// mirrors `dragonvnc_capture::RawFrame`'s approach instead of hiding it.
+pub struct DecodedFrame {
+    pub pixels: bytes::Bytes,
+    pub format: dragonvnc_capture::PixelFormat,
+    /// Bytes per row — may exceed `width * 4`; see `RawFrame::info.stride`.
+    pub stride: u32,
+}
+
 pub trait Decoder: Send {
-    /// Decodes one payload back into tightly-packed RGBA at the given
-    /// dimensions (the caller gets width/height from the wire's
-    /// `FrameHeader`, decoders don't need to track it themselves for the
-    /// passthrough case; a real HEVC decoder would own a decode session
-    /// keyed off the stream instead).
-    fn decode(&mut self, payload: &[u8], width: u32, height: u32) -> anyhow::Result<bytes::Bytes>;
+    /// Decodes one payload at the given dimensions (the caller gets
+    /// width/height from the wire's `FrameHeader`, decoders don't need to
+    /// track it themselves for the passthrough case; a real HEVC decoder
+    /// would own a decode session keyed off the stream instead).
+    fn decode(&mut self, payload: &[u8], width: u32, height: u32) -> anyhow::Result<DecodedFrame>;
 }
 
 /// No-op "codec": ships raw pixels as-is. Useful for proving out the rest of
@@ -77,16 +91,23 @@ impl Encoder for PassthroughCodec {
 pub mod vaapi;
 
 impl Decoder for PassthroughCodec {
-    fn decode(&mut self, payload: &[u8], width: u32, height: u32) -> anyhow::Result<bytes::Bytes> {
+    fn decode(&mut self, payload: &[u8], width: u32, height: u32) -> anyhow::Result<DecodedFrame> {
         let expected = (width * height * 4) as usize;
         anyhow::ensure!(
             payload.len() == expected,
             "passthrough payload size {} != expected {expected} for {width}x{height} RGBA",
             payload.len()
         );
-        Ok(bytes::Bytes::copy_from_slice(payload))
+        Ok(DecodedFrame {
+            pixels: bytes::Bytes::copy_from_slice(payload),
+            format: dragonvnc_capture::PixelFormat::Rgba,
+            stride: width * 4,
+        })
     }
 }
+
+#[cfg(target_os = "macos")]
+pub mod videotoolbox;
 
 #[cfg(test)]
 mod tests {
@@ -110,6 +131,8 @@ mod tests {
         let encoded = codec.encode(&frame).unwrap();
         assert_eq!(encoded.len(), 1);
         let decoded = codec.decode(&encoded[0].payload, 1, 2).unwrap();
-        assert_eq!(decoded, rgba);
+        assert_eq!(decoded.pixels, rgba);
+        assert_eq!(decoded.format, PixelFormat::Rgba);
+        assert_eq!(decoded.stride, 4);
     }
 }

@@ -1,9 +1,11 @@
 //! Demo/debug client binary — companion to dragonvnc-server. Proves the
 //! same pipeline from the receiving end: pairing, control handshake, then
-//! decoding the video stream. No real window/GPU render yet (that's the
-//! `wgpu`/`winit` milestone — see DESIGN.md "Status"); this just decodes
-//! each frame and reports throughput, to prove the bytes arriving are
-//! correct and complete.
+//! decoding the video stream — real VideoToolbox HEVC hardware decode on
+//! macOS (see `dragonvnc_codec::videotoolbox`), `PassthroughCodec` for the
+//! test-pattern path. No real window/GPU render yet (that's the
+//! `wgpu`/`winit` milestone — see DESIGN.md "Status"); this decodes each
+//! frame and reports throughput, to prove the bytes arriving are correct
+//! and complete.
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -13,6 +15,20 @@ use clap::Parser;
 use dragonvnc_codec::Decoder;
 use dragonvnc_net::{endpoint, pairing::PairingCode};
 use dragonvnc_proto::{ControlMessage, FrameHeader, InputEvent, VideoCodec, PROTOCOL_VERSION};
+
+fn make_decoder(codec: VideoCodec) -> anyhow::Result<Box<dyn Decoder>> {
+    match codec {
+        VideoCodec::TestPatternRgba => Ok(Box::new(dragonvnc_codec::PassthroughCodec)),
+        #[cfg(target_os = "macos")]
+        VideoCodec::Hevc => Ok(Box::new(dragonvnc_codec::videotoolbox::VideoToolboxDecoder::new())),
+        #[cfg(not(target_os = "macos"))]
+        VideoCodec::Hevc => anyhow::bail!(
+            "no HEVC decoder on this platform yet (VideoToolbox is macOS-only); pass --dump-raw \
+             to inspect the stream with an independent tool instead"
+        ),
+        VideoCodec::Av1 => anyhow::bail!("no AV1 decoder implemented yet"),
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -24,14 +40,9 @@ struct Args {
     #[arg(long)]
     code: String,
 
-    /// Write the raw video payloads to this file instead of decoding them.
-    /// There's no real decoder wired up client-side yet (see DESIGN.md —
-    /// the client's own decode is the next milestone, VideoToolbox on
-    /// macOS being the actual target platform, unverified without real
-    /// Mac hardware to build/run against); this is how the server's
-    /// hardware-encoded HEVC output gets verified for now — dump it and
-    /// check it with an independent decoder (e.g.
-    /// `ffprobe -f hevc dump.hevc`).
+    /// Write the raw video payloads to this file instead of decoding them
+    /// — useful for inspecting the stream with an independent tool (e.g.
+    /// `ffprobe -f hevc dump.hevc`) instead of this binary's own decoder.
     #[arg(long)]
     dump_raw: Option<PathBuf>,
 
@@ -115,7 +126,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut video_recv = connection.accept_uni().await?;
-    let mut decoder = dragonvnc_codec::PassthroughCodec;
+    // Which decoder to use depends on the codec the server actually sends
+    // (in the first frame's header) — built lazily so a --dump-raw run
+    // never needs one at all.
+    let mut decoder: Option<Box<dyn Decoder>> = None;
     let mut dump_file = args.dump_raw.map(std::fs::File::create).transpose()?;
     let mut frames_this_second = 0u32;
     let mut bytes_this_second = 0u64;
@@ -129,17 +143,13 @@ async fn main() -> anyhow::Result<()> {
         let mut payload = vec![0u8; header.payload_len as usize];
         video_recv.read_exact(&mut payload).await?;
 
-        match (header.codec, &mut dump_file) {
-            (_, Some(f)) => f.write_all(&payload)?,
-            (VideoCodec::TestPatternRgba, None) => {
-                let _rgba = decoder.decode(&payload, header.width, header.height)?;
+        if let Some(f) = &mut dump_file {
+            f.write_all(&payload)?;
+        } else {
+            if decoder.is_none() {
+                decoder = Some(make_decoder(header.codec)?);
             }
-            (other, None) => {
-                anyhow::bail!(
-                    "no client-side decoder for {other:?} yet (see DESIGN.md) — pass \
-                     --dump-raw to inspect the stream instead"
-                );
-            }
+            let _frame = decoder.as_mut().unwrap().decode(&payload, header.width, header.height)?;
         }
 
         frames_this_second += 1;
