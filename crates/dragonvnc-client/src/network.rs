@@ -255,9 +255,21 @@ async fn recv_frame_header(stream: &mut quinn::RecvStream) -> anyhow::Result<Fra
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    anyhow::ensure!(
+        len <= dragonvnc_proto::MAX_FRAME_LEN,
+        "peer declared a {len}-byte frame header, exceeding the {}-byte sanity limit",
+        dragonvnc_proto::MAX_FRAME_LEN
+    );
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
-    Ok(dragonvnc_proto::decode(&buf)?)
+    let header: FrameHeader = dragonvnc_proto::decode(&buf)?;
+    anyhow::ensure!(
+        header.payload_len as usize <= dragonvnc_proto::MAX_FRAME_LEN,
+        "peer declared a {}-byte video payload, exceeding the {}-byte sanity limit",
+        header.payload_len,
+        dragonvnc_proto::MAX_FRAME_LEN
+    );
+    Ok(header)
 }
 
 async fn send_msg(stream: &mut quinn::SendStream, msg: &ControlMessage) -> anyhow::Result<()> {
@@ -271,6 +283,11 @@ async fn recv_msg(stream: &mut quinn::RecvStream) -> anyhow::Result<ControlMessa
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    anyhow::ensure!(
+        len <= dragonvnc_proto::MAX_FRAME_LEN,
+        "peer declared a {len}-byte control message, exceeding the {}-byte sanity limit",
+        dragonvnc_proto::MAX_FRAME_LEN
+    );
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(dragonvnc_proto::decode(&buf)?)

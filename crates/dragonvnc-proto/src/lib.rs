@@ -17,6 +17,17 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Sanity cap for any length-prefixed read on the wire — pairing frames,
+/// control messages, frame headers, and encoded video-frame payloads alike.
+/// None of those are ever legitimately anywhere near this large; a length
+/// field beyond it means a corrupt value or a hostile peer, not a real
+/// payload. Every length-prefixed reader in this workspace checks against
+/// this *before* allocating a buffer sized by an unauthenticated `u32` off
+/// the wire — otherwise a single corrupted or malicious length field can
+/// make either side try to allocate up to 4GiB in one shot, reachable even
+/// pre-pairing (the pairing handshake itself is length-prefixed).
+pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024; // 16 MiB
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
     #[error("failed to encode message: {0}")]

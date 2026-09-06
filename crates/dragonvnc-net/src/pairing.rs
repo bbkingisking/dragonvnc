@@ -83,6 +83,8 @@ pub enum PairingError {
     Exporter,
     #[error("pairing confirmation mismatch — wrong code, or a man-in-the-middle")]
     ConfirmationMismatch,
+    #[error("peer declared a {declared}-byte pairing frame, exceeding the {max}-byte sanity limit — this connection is not yet authenticated, so treating this as hostile rather than allocating")]
+    FrameTooLarge { declared: usize, max: usize },
 }
 
 /// Runs the pairing ceremony over an already-open bidirectional QUIC stream
@@ -154,6 +156,9 @@ async fn recv_frame(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, PairingErro
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > dragonvnc_proto::MAX_FRAME_LEN {
+        return Err(PairingError::FrameTooLarge { declared: len, max: dragonvnc_proto::MAX_FRAME_LEN });
+    }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await?;
     Ok(buf)

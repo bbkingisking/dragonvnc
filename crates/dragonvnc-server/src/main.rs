@@ -472,6 +472,11 @@ async fn recv_msg(stream: &mut quinn::RecvStream) -> anyhow::Result<ControlMessa
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    anyhow::ensure!(
+        len <= dragonvnc_proto::MAX_FRAME_LEN,
+        "peer declared a {len}-byte control message, exceeding the {}-byte sanity limit",
+        dragonvnc_proto::MAX_FRAME_LEN
+    );
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
     Ok(dragonvnc_proto::decode(&buf)?)
