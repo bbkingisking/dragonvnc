@@ -8,3 +8,7 @@ license.workspace = true
 dragonvnc-proto = { path = "../dragonvnc-proto" }
 anyhow.workspace = true
 tracing.workspace = true
+async-trait = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+input-linux = "0.7"

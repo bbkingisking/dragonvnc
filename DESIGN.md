@@ -154,7 +154,43 @@ reappear only if the user revokes access from their desktop's privacy
 settings, same as any other persistent screen-share grant (Discord, OBS,
 etc.).
 
-Still stubbed: input injection (libei/CGEvent), ScreenCaptureKit (macOS
+Milestone 4: **real input injection on Linux, via `uinput`**, verified
+against the live desktop with a real GUI regression caught and fixed along
+the way. Original plan was libei/the XDG `RemoteDesktop` portal (matching
+the ScreenCast approach) — investigated first via `ashpd`'s combined
+session support (`RemoteDesktop::create_session` + `Screencast::select_sources`
+on one session, needed anyway because `NotifyPointerMotionAbsolute`
+requires naming a linked screencast stream). But this box's reference
+portal backend, `xdg-desktop-portal-wlr` v0.7.1, only implements
+`Screenshot`/`ScreenCast` — confirmed via its installed `.portal` file,
+not an assumption — so `RemoteDesktop` isn't available here at all. Pivoted
+to `dragonvnc-input::uinput`: a virtual keyboard+pointer device via the
+`input-linux` crate, compositor-agnostic since it goes through the same
+kernel evdev/libinput path a real device would, needing no portal support.
+Revisit the portal path for desktops whose backend does implement
+`RemoteDesktop` (GNOME, KDE).
+
+Getting a real test running surfaced two more real, fixed issues, neither
+hypothetical:
+
+- `/dev/uinput` is `root:root 0600` by default with no udev rule — added
+  one (`KERNEL=="uinput", GROUP="input", MODE="0660"`) plus
+  `/etc/modules-load.d` to load the module at boot, matching how
+  `ydotool` documents its own setup.
+- First live test moved the cursor to a visibly wrong on-screen position.
+  Verified precisely (not just "looked off") via a pixel-diff between
+  `grim` screenshots taken before/after injection against the live sway
+  session, isolating exactly where the real cursor rendered. Root cause:
+  the virtual device didn't set `INPUT_PROP_DIRECT`, so libinput/wlroots
+  treated it as an indirect tablet tool rather than a direct-mapped
+  pointer — the same property real "absolute mouse" tools (QEMU's
+  usb-tablet, spice-vdagent) rely on. Fixed; re-verification against an
+  exact target coordinate is pending next monitor availability (this
+  box's display is shared with the user's other work and was
+  disconnected again before a second screenshot diff could confirm the
+  fix numerically) — noted here rather than silently assumed fixed.
+
+Still stubbed: ScreenCaptureKit (macOS
 capture — moot anyway, since macOS is the client-only platform here), and
 client-side decode + `wgpu` render. Real client-side decode is deliberately
 not attempted yet: the target client platform is macOS/VideoToolbox, and

@@ -26,6 +26,19 @@
 //! grant silently, no picker, until the user revokes it from their
 //! desktop's privacy settings. That's what `new()` below does; only the
 //! very first-ever run (per `token_path`) needs a human present.
+//!
+//! Input injection is deliberately **not** combined into this session:
+//! the XDG portal also defines a `RemoteDesktop` interface for exactly
+//! that (and this crate briefly did combine them, since
+//! `NotifyPointerMotionAbsolute` needs a linked screencast stream to be
+//! meaningful) — but `xdg-desktop-portal-wlr` (this box's reference
+//! backend, v0.7.1) only implements `Screenshot`/`ScreenCast`, not
+//! `RemoteDesktop` (confirmed via its installed `.portal` file, which
+//! lists exactly those two interfaces). Since that path is unavailable
+//! here, input goes through `dragonvnc-input`'s `uinput` backend instead,
+//! which needs no portal at all — see that crate for why, and for the
+//! GNOME/KDE portals that *do* implement RemoteDesktop, worth revisiting
+//! there.
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -280,7 +293,7 @@ fn run_capture_thread(
             pw::spa::param::video::VideoFormat::RGBA,
             pw::spa::param::video::VideoFormat::RGBx,
             pw::spa::param::video::VideoFormat::BGRA,
-            pw::spa::param::video::VideoFormat::BGRx,
+            pw::spa::param::video::VideoFormat::BGRx
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::VideoSize,
@@ -299,7 +312,7 @@ fn run_capture_thread(
             pw::spa::utils::Fraction { num: 30, denom: 1 },
             pw::spa::utils::Fraction { num: 0, denom: 1 },
             pw::spa::utils::Fraction { num: 1000, denom: 1 }
-        ),
+        )
     );
     let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),

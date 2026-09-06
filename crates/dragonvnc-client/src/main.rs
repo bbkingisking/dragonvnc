@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use dragonvnc_codec::Decoder;
 use dragonvnc_net::{endpoint, pairing::PairingCode};
-use dragonvnc_proto::{ControlMessage, FrameHeader, VideoCodec, PROTOCOL_VERSION};
+use dragonvnc_proto::{ControlMessage, FrameHeader, InputEvent, VideoCodec, PROTOCOL_VERSION};
 
 #[derive(Parser)]
 struct Args {
@@ -34,6 +34,25 @@ struct Args {
     /// `ffprobe -f hevc dump.hevc`).
     #[arg(long)]
     dump_raw: Option<PathBuf>,
+
+    /// Send one synthetic pointer move to "x,y" right after the control
+    /// handshake, then a left click. There's no real client UI generating
+    /// input yet (see DESIGN.md) — this is how real server-side input
+    /// injection gets verified for now: send a scripted event and check
+    /// the compositor's actual cursor position moved (e.g. via
+    /// `swaymsg -t get_seats`).
+    #[arg(long, value_parser = parse_xy)]
+    move_to: Option<(f32, f32)>,
+}
+
+fn parse_xy(s: &str) -> Result<(f32, f32), String> {
+    let (x, y) = s
+        .split_once(',')
+        .ok_or_else(|| "expected \"x,y\"".to_string())?;
+    Ok((
+        x.trim().parse().map_err(|_| "bad x".to_string())?,
+        y.trim().parse().map_err(|_| "bad y".to_string())?,
+    ))
 }
 
 #[tokio::main]
@@ -73,6 +92,27 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("expected Welcome, got {welcome:?}");
     };
     tracing::info!(%server_name, ?displays, "server said welcome");
+
+    if let Some((x, y)) = args.move_to {
+        send_msg(&mut ctrl_send, &ControlMessage::Input(InputEvent::PointerMove { x, y })).await?;
+        send_msg(
+            &mut ctrl_send,
+            &ControlMessage::Input(InputEvent::PointerButton {
+                button: dragonvnc_proto::PointerButton::Left,
+                pressed: true,
+            }),
+        )
+        .await?;
+        send_msg(
+            &mut ctrl_send,
+            &ControlMessage::Input(InputEvent::PointerButton {
+                button: dragonvnc_proto::PointerButton::Left,
+                pressed: false,
+            }),
+        )
+        .await?;
+        tracing::info!(x, y, "sent synthetic pointer move + left click");
+    }
 
     let mut video_recv = connection.accept_uni().await?;
     let mut decoder = dragonvnc_codec::PassthroughCodec;

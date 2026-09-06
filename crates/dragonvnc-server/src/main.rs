@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use dragonvnc_capture::{FrameSource, TestPatternSource};
+use dragonvnc_input::InputInjector;
 use dragonvnc_net::{endpoint, pairing, ServerIdentity};
 use dragonvnc_proto::{ControlMessage, FrameHeader, PROTOCOL_VERSION};
 
@@ -155,12 +156,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn make_source(
-    source: Source,
-    width: u32,
-    height: u32,
-    fps: u32,
-) -> anyhow::Result<Box<dyn FrameSource>> {
+async fn make_source(source: Source, width: u32, height: u32, fps: u32) -> anyhow::Result<Box<dyn FrameSource>> {
     match source {
         Source::TestPattern => Ok(Box::new(TestPatternSource::new(width, height, fps))),
         #[cfg(target_os = "linux")]
@@ -171,6 +167,22 @@ async fn make_source(
         Source::Pipewire => anyhow::bail!(
             "--source pipewire is Linux-only (PipeWire/XDG portal); this build was compiled for a different target"
         ),
+    }
+}
+
+/// Built from the first captured frame's real dimensions, same reasoning
+/// as `make_encoder` — a synthetic test pattern has nothing real to
+/// inject into, so it pairs with a logging-only stub; real capture pairs
+/// with the real `uinput` backend (see `dragonvnc_input::uinput`'s module
+/// doc for why not the XDG RemoteDesktop portal on this reference
+/// compositor).
+fn make_injector(source: Source, width: u32, height: u32) -> anyhow::Result<Box<dyn InputInjector>> {
+    match source {
+        Source::TestPattern => Ok(Box::new(dragonvnc_input::LoggingInjector)),
+        #[cfg(target_os = "linux")]
+        Source::Pipewire => Ok(Box::new(dragonvnc_input::uinput::UinputInjector::new(width, height)?)),
+        #[cfg(not(target_os = "linux"))]
+        Source::Pipewire => Ok(Box::new(dragonvnc_input::LoggingInjector)),
     }
 }
 
@@ -204,7 +216,7 @@ fn make_encoder(
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     incoming: quinn::Incoming,
-    source: Source,
+    source_kind: Source,
     width: u32,
     height: u32,
     fps: u32,
@@ -241,7 +253,7 @@ async fn handle_connection(
     // dimensions until the portal/PipeWire negotiate a format, which can
     // only happen after connecting — there's no static answer to hand back
     // for the Welcome message the way `--width`/`--height` gave one before.
-    let mut source: Box<dyn FrameSource> = make_source(source, width, height, fps).await?;
+    let mut source: Box<dyn FrameSource> = make_source(source_kind, width, height, fps).await?;
     let first_frame = source
         .next_frame()
         .await?
@@ -252,6 +264,8 @@ async fn handle_connection(
         format = ?first_frame.info.format,
         "capture started"
     );
+    let mut injector: Box<dyn InputInjector> =
+        make_injector(source_kind, first_frame.info.width, first_frame.info.height)?;
 
     send_msg(
         &mut ctrl_send,
@@ -278,6 +292,28 @@ async fn handle_connection(
         #[cfg(target_os = "linux")]
         &vaapi_device,
     )?;
+
+    // Input: further messages on the control stream after Hello/Welcome
+    // (currently just input events; clipboard/resize would land here too).
+    // Runs concurrently with the video loop below so a burst of mouse
+    // moves can never queue behind a video frame or vice versa. Sharing
+    // the control stream for both input and clipboard/resize (rather than
+    // input getting its own dedicated stream, as DESIGN.md calls for) is a
+    // v1 simplification — revisit if clipboard traffic ever needs to not
+    // queue behind input.
+    let input_task = tokio::spawn(async move {
+        loop {
+            match recv_msg(&mut ctrl_recv).await {
+                Ok(ControlMessage::Input(event)) => {
+                    if let Err(e) = injector.inject(event).await {
+                        tracing::warn!(error = %e, "failed to inject input event");
+                    }
+                }
+                Ok(other) => tracing::debug!(?other, "ignoring non-input control message"),
+                Err(_) => break, // connection gone
+            }
+        }
+    });
 
     // Video stream: capture -> encode -> length-prefixed frames on a
     // dedicated reliable uni stream. Real transport tuning (chunked,
@@ -319,6 +355,7 @@ async fn handle_connection(
             frame_id += 1;
         }
     }
+    input_task.abort();
 
     Ok(())
 }
