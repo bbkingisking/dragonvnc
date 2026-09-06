@@ -154,41 +154,55 @@ reappear only if the user revokes access from their desktop's privacy
 settings, same as any other persistent screen-share grant (Discord, OBS,
 etc.).
 
-Milestone 4: **real input injection on Linux, via `uinput`**, verified
-against the live desktop with a real GUI regression caught and fixed along
-the way. Original plan was libei/the XDG `RemoteDesktop` portal (matching
-the ScreenCast approach) — investigated first via `ashpd`'s combined
-session support (`RemoteDesktop::create_session` + `Screencast::select_sources`
-on one session, needed anyway because `NotifyPointerMotionAbsolute`
-requires naming a linked screencast stream). But this box's reference
-portal backend, `xdg-desktop-portal-wlr` v0.7.1, only implements
-`Screenshot`/`ScreenCast` — confirmed via its installed `.portal` file,
-not an assumption — so `RemoteDesktop` isn't available here at all. Pivoted
-to `dragonvnc-input::uinput`: a virtual keyboard+pointer device via the
-`input-linux` crate, compositor-agnostic since it goes through the same
-kernel evdev/libinput path a real device would, needing no portal support.
-Revisit the portal path for desktops whose backend does implement
-`RemoteDesktop` (GNOME, KDE).
+Milestone 4: **real input injection on Linux — pointer via the Wayland
+`wlr-virtual-pointer-unstable-v1` protocol, keyboard via `uinput`** —
+verified against the live desktop with the cursor landing on an exact
+target pixel, arrived at after two real, fixed missteps along the way (not
+hypothetical — each one caught with independent tooling against the live
+compositor, the same rigor as the capture/encode milestones):
 
-Getting a real test running surfaced two more real, fixed issues, neither
-hypothetical:
+1. Original plan was the XDG `RemoteDesktop` portal (matching the
+   ScreenCast approach, combined on one session per `ashpd`'s documented
+   pattern, since `NotifyPointerMotionAbsolute` needs a linked screencast
+   stream). Blocked: this box's reference portal backend,
+   `xdg-desktop-portal-wlr` v0.7.1, only implements
+   `Screenshot`/`ScreenCast` — confirmed via its installed `.portal` file,
+   not assumed. Worth revisiting for portals that do implement
+   `RemoteDesktop` (GNOME, KDE).
+2. Pivoted to `uinput` for *both* pointer and keyboard: a virtual device
+   via the `input-linux` crate. Needed a new udev rule
+   (`/dev/uinput` is `root:root 0600` by default, no rule out of the box)
+   plus `/etc/modules-load.d`, matching `ydotool`'s documented setup.
+   First live test moved the cursor to a visibly wrong position — verified
+   precisely via a `grim` screenshot pixel-diff against the live sway
+   session (not just "looked off"), which located exactly where the
+   cursor actually rendered. Root cause #1: missing `INPUT_PROP_DIRECT`.
+   Fixing that surfaced root cause #2, from `libinput debug-events`
+   directly: a uinput device combining absolute axes with conventional
+   pointer buttons (BTN_LEFT/RIGHT/MIDDLE) gets classified by libinput as
+   a **graphics tablet**, which requires proximity handshaking
+   (`BTN_TOOL_PEN` in/out) our plain `ABS_X`/`ABS_Y` events don't provide
+   — so the device was actually being silently ignored the whole time,
+   not just miscalibrated.
+3. Rather than keep fighting libinput's device-classification heuristics
+   for something evdev doesn't cleanly model (an "absolute mouse" isn't a
+   touchscreen, a tablet, or a relative pointer), switched pointer
+   injection to `dragonvnc-input::wlr_pointer`: the Wayland
+   `wlr-virtual-pointer-unstable-v1` protocol, purpose-built for exactly
+   this and already used by `wayvnc` (an existing wlroots VNC server) for
+   the same reason. `motion_absolute(x, y, x_extent, y_extent)` is
+   unambiguous, compositor-interpreted pointer motion — no kernel evdev
+   device classification involved at all. Keyboard stayed on `uinput`
+   (a keys-only device has no such classification ambiguity).
 
-- `/dev/uinput` is `root:root 0600` by default with no udev rule — added
-  one (`KERNEL=="uinput", GROUP="input", MODE="0660"`) plus
-  `/etc/modules-load.d` to load the module at boot, matching how
-  `ydotool` documents its own setup.
-- First live test moved the cursor to a visibly wrong on-screen position.
-  Verified precisely (not just "looked off") via a pixel-diff between
-  `grim` screenshots taken before/after injection against the live sway
-  session, isolating exactly where the real cursor rendered. Root cause:
-  the virtual device didn't set `INPUT_PROP_DIRECT`, so libinput/wlroots
-  treated it as an indirect tablet tool rather than a direct-mapped
-  pointer — the same property real "absolute mouse" tools (QEMU's
-  usb-tablet, spice-vdagent) rely on. Fixed; re-verification against an
-  exact target coordinate is pending next monitor availability (this
-  box's display is shared with the user's other work and was
-  disconnected again before a second screenshot diff could confirm the
-  fix numerically) — noted here rather than silently assumed fixed.
+Verified live, end to end, through the real server and client: connect,
+capture (real desktop), encode (real VAAPI HEVC), inject a pointer move to
+an exact target coordinate over the real QUIC transport, and confirm via a
+`grim` screenshot that the real compositor cursor rendered within a few
+pixels of that exact target (the residual few pixels being the cursor
+icon's hotspot offset, not mapping error) — alongside a still-healthy,
+independently `ffprobe`-verified video stream. Both the keyboard and
+pointer virtual devices are created and torn down per connection.
 
 Still stubbed: ScreenCaptureKit (macOS
 capture — moot anyway, since macOS is the client-only platform here), and

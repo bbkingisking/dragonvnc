@@ -180,7 +180,7 @@ fn make_injector(source: Source, width: u32, height: u32) -> anyhow::Result<Box<
     match source {
         Source::TestPattern => Ok(Box::new(dragonvnc_input::LoggingInjector)),
         #[cfg(target_os = "linux")]
-        Source::Pipewire => Ok(Box::new(dragonvnc_input::uinput::UinputInjector::new(width, height)?)),
+        Source::Pipewire => Ok(Box::new(dragonvnc_input::linux::LinuxInjector::new(width, height)?)),
         #[cfg(not(target_os = "linux"))]
         Source::Pipewire => Ok(Box::new(dragonvnc_input::LoggingInjector)),
     }

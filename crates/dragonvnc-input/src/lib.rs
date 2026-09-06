@@ -1,12 +1,13 @@
-//! Remote-input injection abstraction. Real backend on Linux: the XDG
-//! Desktop Portal RemoteDesktop interface (see
-//! `dragonvnc-capture::pipewire::RemoteDesktopInput` — it lives in the
-//! capture crate because a correct implementation needs to share one
-//! portal session with screen capture; see that module's docs). `CGEvent`
-//! posting on macOS is still the next milestone — see DESIGN.md "Status".
-//! This crate defines the trait boundary plus a logging-only stub so the
-//! server's input stream has somewhere to go on platforms/paths without a
-//! real injector wired up.
+//! Remote-input injection abstraction. Real backend on Linux:
+//! `linux::LinuxInjector`, combining `wlr_pointer` (Wayland
+//! `wlr-virtual-pointer-unstable-v1` protocol, for the pointer) with
+//! `uinput` (kernel evdev, for the keyboard) — see those modules' docs for
+//! why pointer and keyboard need different mechanisms here, and why the
+//! originally-planned XDG `RemoteDesktop` portal path isn't available on
+//! this reference compositor. `CGEvent` posting on macOS is still the next
+//! milestone — see DESIGN.md "Status". This crate defines the trait
+//! boundary plus a logging-only stub so the server's input stream has
+//! somewhere to go on platforms/paths without a real injector wired up.
 
 use async_trait::async_trait;
 use dragonvnc_proto::InputEvent;
@@ -28,3 +29,7 @@ impl InputInjector for LoggingInjector {
 
 #[cfg(target_os = "linux")]
 pub mod uinput;
+#[cfg(target_os = "linux")]
+pub mod wlr_pointer;
+#[cfg(target_os = "linux")]
+pub mod linux;

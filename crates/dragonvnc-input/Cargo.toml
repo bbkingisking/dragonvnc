@@ -12,3 +12,5 @@ async-trait = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 input-linux = "0.7"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
