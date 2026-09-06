@@ -13,8 +13,13 @@
 //!
 //! PipeWire's stream API is callback-based and runs its own blocking main
 //! loop; it's bridged to this crate's async `FrameSource` by running that
-//! loop on a dedicated OS thread and forwarding completed frames over an
-//! unbounded channel.
+//! loop on a dedicated OS thread and forwarding completed frames over a
+//! `watch` channel, which holds only the single latest frame. If whatever's
+//! downstream (encode + network send) falls behind capture, a newer frame
+//! simply overwrites the one still waiting to be picked up instead of
+//! queuing behind it — there's no value in eventually encoding a stale
+//! frame anyway, and it makes unbounded memory growth from a slow
+//! consumer structurally impossible here rather than merely logged.
 //!
 //! The portal's screen-picker is an interactive human-consent flow — fine
 //! for "an app asks to share your screen," wrong for an always-on remote
@@ -49,12 +54,12 @@ use ashpd::desktop::PersistMode;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pipewire as pw;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use crate::{FrameInfo, FrameSource, PixelFormat, RawFrame};
 
 pub struct PipeWireSource {
-    rx: mpsc::UnboundedReceiver<RawFrame>,
+    rx: watch::Receiver<Option<RawFrame>>,
     // Kept alive for the source's lifetime; the capture thread runs until
     // the process exits or the channel receiver drops and a send fails.
     // TODO: no graceful shutdown signal yet (join the thread on drop) —
@@ -104,7 +109,7 @@ impl PipeWireSource {
         let node_id = stream_info.pipe_wire_node_id();
         tracing::info!(node_id, size = ?stream_info.size(), "screencast portal session started");
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = watch::channel(None);
         let started = Instant::now();
         let thread = std::thread::Builder::new()
             .name("dragonvnc-pipewire".into())
@@ -121,18 +126,16 @@ impl PipeWireSource {
 #[async_trait]
 impl FrameSource for PipeWireSource {
     async fn next_frame(&mut self) -> anyhow::Result<Option<RawFrame>> {
-        let frame = self.rx.recv().await;
-        // A backlog here means the capture thread is producing frames
-        // faster than whatever's downstream (encode + network send) is
-        // draining them — the unbounded channel just keeps growing rather
-        // than blocking, so this is the only place that backpressure is
-        // visible at all. A real lead on "video hitches/freezes" if it
-        // shows up: the capture side is fine, something after it is slow.
-        let backlog = self.rx.len();
-        if backlog > 5 {
-            tracing::warn!(backlog, "pipewire frame queue is backing up — encode/send is falling behind capture");
+        // `changed()` waits for a frame newer than the one this receiver
+        // last observed; because the channel only ever holds the single
+        // latest value (see module doc), any frames the capture thread
+        // produced while this side was busy were already coalesced away
+        // for us — there is no backlog to drain here, by construction. An
+        // error means every sender is gone, i.e. the capture thread ended.
+        if self.rx.changed().await.is_err() {
+            return Ok(None);
         }
-        Ok(frame)
+        Ok(self.rx.borrow_and_update().clone())
     }
 }
 
@@ -191,7 +194,7 @@ async fn open_portal(token_path: &Path) -> anyhow::Result<(PortalStream, OwnedFd
 /// — no locking needed).
 struct CaptureState {
     format: pw::spa::param::video::VideoInfoRaw,
-    tx: mpsc::UnboundedSender<RawFrame>,
+    tx: watch::Sender<Option<RawFrame>>,
     started: Instant,
     // Periodic throughput/drop visibility — dropped/malformed buffers are
     // otherwise invisible (each individual one is a silent early return),
@@ -243,7 +246,7 @@ fn map_pixel_format(format: pw::spa::param::video::VideoFormat) -> Option<PixelF
 fn run_capture_thread(
     node_id: u32,
     fd: OwnedFd,
-    tx: mpsc::UnboundedSender<RawFrame>,
+    tx: watch::Sender<Option<RawFrame>>,
     started: Instant,
 ) -> anyhow::Result<()> {
     pw::init();
@@ -371,7 +374,7 @@ fn run_capture_thread(
             // time this was tested live) so a capture thread that's still
             // alive but talking to nobody shows up in the logs instead of
             // silently looking like "no video, no clue why".
-            if state.tx.send(frame).is_err() {
+            if state.tx.send(Some(frame)).is_err() {
                 tracing::info!("pipewire capture thread has no receiver (session ended) — will keep running silently, see module doc");
                 state.receiver_gone = true;
             }
