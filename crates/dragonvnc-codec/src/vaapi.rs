@@ -283,6 +283,7 @@ impl VaapiHevcEncoder {
                 });
             }
         }
+        tracing::trace!(packets = out.len(), "drained encoder packets");
         Ok(out)
     }
 }
@@ -324,6 +325,8 @@ impl Encoder for VaapiHevcEncoder {
             self.src_format
         );
 
+        let started = std::time::Instant::now();
+        let sws_started = started;
         unsafe {
             let src_data: [*const u8; 4] =
                 [frame.pixels.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
@@ -349,7 +352,11 @@ impl Encoder for VaapiHevcEncoder {
                 dst_data.as_ptr(),
                 dst_linesize.as_ptr(),
             );
+        }
+        let sws_elapsed = sws_started.elapsed();
 
+        let hw_started = std::time::Instant::now();
+        unsafe {
             ff::av_frame_unref(self.hw_frame);
             check(
                 "av_hwframe_get_buffer",
@@ -361,11 +368,35 @@ impl Encoder for VaapiHevcEncoder {
             )?;
             (*self.hw_frame).pts = self.frame_index;
             self.frame_index += 1;
+        }
+        let hw_transfer_elapsed = hw_started.elapsed();
 
+        let send_started = std::time::Instant::now();
+        unsafe {
             check(
                 "avcodec_send_frame",
                 ff::avcodec_send_frame(self.codec_ctx, self.hw_frame),
             )?;
+        }
+        let send_frame_elapsed = send_started.elapsed();
+
+        tracing::trace!(
+            ?sws_elapsed,
+            ?hw_transfer_elapsed,
+            ?send_frame_elapsed,
+            frame_index = self.frame_index,
+            "encode stage timings"
+        );
+        // A hardware-accelerated pixel format conversion + VAAPI submission
+        // should be low single-digit milliseconds at these resolutions. If
+        // the *total* creeps up, that's this encoder (GPU busy/thermal
+        // throttled, driver hiccup) rather than the network — a useful
+        // distinction when triaging "the desktop hitches" reports, since
+        // the higher-level per-frame warning in dragonvnc-server can't
+        // tell which stage was actually slow.
+        let total_elapsed = started.elapsed();
+        if total_elapsed > std::time::Duration::from_millis(50) {
+            tracing::warn!(?total_elapsed, ?sws_elapsed, ?hw_transfer_elapsed, ?send_frame_elapsed, "VAAPI encode took unusually long");
         }
 
         Ok(self.drain()?)

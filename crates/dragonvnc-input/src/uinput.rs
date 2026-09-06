@@ -85,11 +85,21 @@ impl UinputKeyboard {
     }
 
     pub fn key(&mut self, keycode: u32, pressed: bool) -> anyhow::Result<()> {
+        tracing::trace!(keycode, pressed, "uinput: injecting key event");
         let key = Key::from_code(keycode as u16)
             .map_err(|_| anyhow::anyhow!("keycode {keycode} is out of evdev's range"))?;
         let state = if pressed { EvdevKeyState::PRESSED } else { EvdevKeyState::RELEASED };
         let t = now();
+        let started = std::time::Instant::now();
         self.handle.write(&[raw(KeyEvent::new(t, key, state)), raw(SynchronizeEvent::report(t))])?;
+        let elapsed = started.elapsed();
+        if elapsed > std::time::Duration::from_millis(50) {
+            // A blocked write(2) to /dev/uinput would show up here — worth
+            // distinguishing from a compositor/wlr-side stall, since this
+            // is purely a kernel-level device write with no network or
+            // compositor involvement at all.
+            tracing::warn!(?elapsed, "uinput device write took unusually long");
+        }
         Ok(())
     }
 }

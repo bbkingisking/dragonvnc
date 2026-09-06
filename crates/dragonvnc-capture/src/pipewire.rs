@@ -42,7 +42,7 @@
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, Stream as PortalStream};
 use ashpd::desktop::PersistMode;
@@ -73,7 +73,34 @@ impl PipeWireSource {
     /// capture — e.g. this box's reference `sway` session was briefly
     /// down to zero physical outputs attached during development.
     pub async fn new(token_path: &Path) -> anyhow::Result<Self> {
-        let (stream_info, fd) = open_portal(token_path).await?;
+        // Caught live during development: a restore token that's gone
+        // stale (e.g. after the compositor briefly had zero outputs
+        // attached, or the grant was revoked from the desktop's privacy
+        // settings) makes the portal silently fall back to its interactive
+        // picker (`xdg-desktop-portal-wlr` shells out to `slurp`) instead of
+        // restoring silently — exactly the failure module doc above says
+        // this token exists to avoid. For an unattended server, nobody's
+        // there to answer it, so without this timeout `open_portal` hangs
+        // forever: indistinguishable from a "the server just freezes"
+        // report unless it's bounded and logged. 30s is generous for the
+        // normal (silent-restore) path, which usually completes in well
+        // under a second.
+        let portal_started = Instant::now();
+        let (stream_info, fd) =
+            match tokio::time::timeout(Duration::from_secs(30), open_portal(token_path)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    anyhow::bail!(
+                        "screencast portal did not respond within 30s — this usually means the \
+                         restore token went stale and the portal fell back to an interactive \
+                         picker (e.g. xdg-desktop-portal-wlr's `slurp`) with nobody present to \
+                         answer it; check for (and kill) a stuck picker process, or delete {} to \
+                         force a fresh grant next run",
+                        token_path.display()
+                    );
+                }
+            };
+        tracing::debug!(elapsed = ?portal_started.elapsed(), "screencast portal setup completed");
         let node_id = stream_info.pipe_wire_node_id();
         tracing::info!(node_id, size = ?stream_info.size(), "screencast portal session started");
 
@@ -94,7 +121,18 @@ impl PipeWireSource {
 #[async_trait]
 impl FrameSource for PipeWireSource {
     async fn next_frame(&mut self) -> anyhow::Result<Option<RawFrame>> {
-        Ok(self.rx.recv().await)
+        let frame = self.rx.recv().await;
+        // A backlog here means the capture thread is producing frames
+        // faster than whatever's downstream (encode + network send) is
+        // draining them — the unbounded channel just keeps growing rather
+        // than blocking, so this is the only place that backpressure is
+        // visible at all. A real lead on "video hitches/freezes" if it
+        // shows up: the capture side is fine, something after it is slow.
+        let backlog = self.rx.len();
+        if backlog > 5 {
+            tracing::warn!(backlog, "pipewire frame queue is backing up — encode/send is falling behind capture");
+        }
+        Ok(frame)
     }
 }
 
@@ -155,6 +193,40 @@ struct CaptureState {
     format: pw::spa::param::video::VideoInfoRaw,
     tx: mpsc::UnboundedSender<RawFrame>,
     started: Instant,
+    // Periodic throughput/drop visibility — dropped/malformed buffers are
+    // otherwise invisible (each individual one is a silent early return),
+    // so a real stall here (compositor stops damaging, buffer format goes
+    // sideways, etc.) would look identical to "nothing's wrong, just no
+    // video" without these counters.
+    stats_window_started: Instant,
+    frames_forwarded_this_window: u32,
+    frames_dropped_this_window: u32,
+    // Set once the receiver is gone (session ended) so the debug log below
+    // fires exactly once instead of on every subsequent buffer — this
+    // thread has no shutdown signal yet (see `PipeWireSource`'s doc) and
+    // keeps calling this callback for as long as the compositor keeps
+    // damaging the screen, which is indefinitely for a live desktop.
+    receiver_gone: bool,
+}
+
+/// Called from the (single-threaded) pipewire loop on every processed
+/// buffer, forwarded or dropped. Logs a throughput/drop summary every 5s at
+/// info level — cheap enough to leave on unconditionally, and exactly the
+/// kind of thing worth having already logged by the time someone notices a
+/// freeze, rather than needing to reproduce it with more verbose logging on.
+fn report_capture_stats(state: &mut CaptureState) {
+    if state.stats_window_started.elapsed() < Duration::from_secs(5) {
+        return;
+    }
+    let window = state.stats_window_started.elapsed();
+    tracing::info!(
+        fps = state.frames_forwarded_this_window as f64 / window.as_secs_f64(),
+        dropped = state.frames_dropped_this_window,
+        "pipewire capture stats"
+    );
+    state.frames_forwarded_this_window = 0;
+    state.frames_dropped_this_window = 0;
+    state.stats_window_started = Instant::now();
 }
 
 fn map_pixel_format(format: pw::spa::param::video::VideoFormat) -> Option<PixelFormat> {
@@ -184,6 +256,10 @@ fn run_capture_thread(
         format: Default::default(),
         tx,
         started,
+        stats_window_started: Instant::now(),
+        frames_forwarded_this_window: 0,
+        frames_dropped_this_window: 0,
+        receiver_gone: false,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -224,21 +300,44 @@ fn run_capture_thread(
             );
         })
         .process(|stream, state| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+            if state.receiver_gone {
+                // Nobody's listening (session ended) but this thread has no
+                // shutdown signal yet (see `PipeWireSource`'s doc) and the
+                // compositor keeps calling this callback for as long as the
+                // screen keeps changing — i.e. forever, for a live desktop.
+                // Already logged once below; from here on just drain the
+                // buffer back to pipewire with no further work or logging,
+                // so a long-lived server with several past connections
+                // doesn't build up ever-growing log volume for sessions
+                // nobody's watching anymore.
+                let _ = stream.dequeue_buffer();
                 return;
+            }
+            macro_rules! drop_frame {
+                ($reason:expr) => {{
+                    tracing::debug!(reason = $reason, "pipewire process callback dropped a buffer");
+                    state.frames_dropped_this_window += 1;
+                    report_capture_stats(state);
+                    return;
+                }};
+            }
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                drop_frame!("dequeue_buffer returned nothing (no buffer ready)");
             };
             let datas = buffer.datas_mut();
             if datas.is_empty() {
-                return;
+                drop_frame!("buffer had no data planes");
             }
             let data = &mut datas[0];
             let stride = data.chunk().stride();
             let size = data.chunk().size() as usize;
             if size == 0 || stride <= 0 {
-                return; // empty/corrupted chunk — nothing to forward
+                drop_frame!("empty/corrupted chunk (size or stride is zero)");
             }
             let Some(pixel_format) = map_pixel_format(state.format.format()) else {
                 tracing::warn!(format = ?state.format.format(), "unsupported negotiated pixel format, dropping frame");
+                state.frames_dropped_this_window += 1;
+                report_capture_stats(state);
                 return;
             };
             let Some(mapped) = data.data() else {
@@ -246,7 +345,7 @@ fn run_capture_thread(
                 // backend deliberately doesn't negotiate for (see module
                 // doc), or an SPA_DATA_MemFd not mapped by MAP_BUFFERS for
                 // some reason. Either way, nothing we can read here yet.
-                return;
+                drop_frame!("no mapped pointer for this buffer (unexpected DMA-BUF or unmapped memfd?)");
             };
             let len = size.min(mapped.len());
 
@@ -260,11 +359,22 @@ fn run_capture_thread(
                 },
                 pixels: Bytes::copy_from_slice(&mapped[..len]),
             };
+            state.frames_forwarded_this_window += 1;
+            report_capture_stats(state);
             // Receiver gone means the server is shutting this session down;
             // nothing to do but let the buffer drop (queues itself back to
             // pipewire via `Buffer`'s `Drop` impl) and keep spinning until
-            // the process/session actually tears down this thread.
-            let _ = state.tx.send(frame);
+            // the process/session actually tears down this thread — which
+            // (see `receiver_gone`'s doc) is never, for a live desktop. Log
+            // this transition exactly once (not on every future buffer —
+            // that turned this into an unbounded-log-growth bug the first
+            // time this was tested live) so a capture thread that's still
+            // alive but talking to nobody shows up in the logs instead of
+            // silently looking like "no video, no clue why".
+            if state.tx.send(frame).is_err() {
+                tracing::info!("pipewire capture thread has no receiver (session ended) — will keep running silently, see module doc");
+                state.receiver_gone = true;
+            }
         })
         .register()?;
 

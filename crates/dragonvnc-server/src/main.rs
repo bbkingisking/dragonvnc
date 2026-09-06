@@ -14,6 +14,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use dragonvnc_capture::{FrameSource, TestPatternSource};
@@ -123,8 +124,10 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         let Some(incoming) = ep.accept().await else {
+            tracing::info!("endpoint stopped accepting (shutting down)");
             break;
         };
+        tracing::debug!(peer = %incoming.remote_address(), "incoming connection");
         let source = args.source;
         let width = args.width;
         let height = args.height;
@@ -302,15 +305,34 @@ async fn handle_connection(
     // v1 simplification — revisit if clipboard traffic ever needs to not
     // queue behind input.
     let input_task = tokio::spawn(async move {
+        let mut injected = 0u64;
         loop {
             match recv_msg(&mut ctrl_recv).await {
                 Ok(ControlMessage::Input(event)) => {
+                    tracing::trace!(?event, "input event received");
+                    let started = Instant::now();
                     if let Err(e) = injector.inject(event).await {
                         tracing::warn!(error = %e, "failed to inject input event");
                     }
+                    let elapsed = started.elapsed();
+                    if elapsed > Duration::from_millis(50) {
+                        // Injection is a handful of syscalls/socket writes —
+                        // it should never take this long. If it does, that's
+                        // a real lead on a "the desktop stopped responding"
+                        // freeze report: the injector (uinput write, wlr
+                        // socket flush) is itself blocking.
+                        tracing::warn!(?elapsed, "input injection took unusually long");
+                    }
+                    injected += 1;
                 }
                 Ok(other) => tracing::debug!(?other, "ignoring non-input control message"),
-                Err(_) => break, // connection gone
+                Err(e) => {
+                    // Not silent anymore: a "the client stopped responding"
+                    // report is indistinguishable from "the control stream
+                    // died and nobody logged why" unless this is visible.
+                    tracing::info!(error = %e, injected, "control stream ended, stopping input task");
+                    break;
+                }
             }
         }
     });
@@ -322,6 +344,12 @@ async fn handle_connection(
     let mut video_send = connection.open_uni().await?;
     let mut frame_id = 0u64;
     let mut pending_frame = Some(first_frame);
+    let session_started = Instant::now();
+    let mut stats_window_started = Instant::now();
+    let mut frames_this_window = 0u32;
+    let mut bytes_this_window = 0u64;
+    let mut total_frames_sent = 0u64;
+    let mut total_bytes_sent = 0u64;
     // NOTE: encode() below runs synchronous, blocking FFI (CPU pixel
     // conversion + a VAAPI submission) directly inside this async task.
     // Fine for this milestone's frame rates; a real deployment should move
@@ -332,10 +360,26 @@ async fn handle_connection(
             Some(f) => f,
             None => match source.next_frame().await? {
                 Some(f) => f,
-                None => break,
+                None => {
+                    tracing::info!("capture source produced no more frames, ending video stream");
+                    break;
+                }
             },
         };
-        for encoded in encoder.encode(&frame)? {
+
+        let encode_started = Instant::now();
+        let encoded_frames = encoder.encode(&frame)?;
+        let encode_elapsed = encode_started.elapsed();
+        if encode_elapsed > Duration::from_millis(200) {
+            // A hardware encoder should turn a frame around in low single-
+            // digit milliseconds. Anything in the hundreds is either a
+            // driver/GPU stall or this task got starved for CPU time —
+            // either way, a real lead if frames are visibly hitching.
+            tracing::warn!(?encode_elapsed, width = frame.info.width, height = frame.info.height, "encode() took unusually long");
+        }
+        tracing::trace!(?encode_elapsed, packets = encoded_frames.len(), "frame encoded");
+
+        for encoded in encoded_frames {
             let header = FrameHeader {
                 display_id: 0,
                 frame_id,
@@ -346,16 +390,59 @@ async fn handle_connection(
                 keyframe: encoded.keyframe,
                 payload_len: encoded.payload.len() as u32,
             };
-            if send_video_frame(&mut video_send, &header, &encoded.payload)
-                .await
-                .is_err()
-            {
+            let send_started = Instant::now();
+            let send_result = send_video_frame(&mut video_send, &header, &encoded.payload).await;
+            let send_elapsed = send_started.elapsed();
+            if send_elapsed > Duration::from_millis(200) {
+                // A blocked/slow QUIC write here means the client (or the
+                // network path) can't keep up — congestion, packet loss, or
+                // the client-side decode/render loop stalling and no longer
+                // reading. This is the single most likely site for a
+                // "sometimes freezes" report to actually be born.
+                tracing::warn!(?send_elapsed, payload_len = encoded.payload.len(), "video frame send took unusually long — client/network may be falling behind");
+            }
+            if let Err(e) = send_result {
+                tracing::info!(
+                    error = %e,
+                    frame_id,
+                    total_frames_sent,
+                    total_bytes_sent,
+                    alive = ?session_started.elapsed(),
+                    "video stream write failed, ending session"
+                );
                 break 'outer; // client went away
             }
             frame_id += 1;
+            total_frames_sent += 1;
+            total_bytes_sent += encoded.payload.len() as u64;
+            frames_this_window += 1;
+            bytes_this_window += encoded.payload.len() as u64;
+        }
+
+        if stats_window_started.elapsed() >= Duration::from_secs(5) {
+            let stats = connection.stats();
+            tracing::info!(
+                fps = frames_this_window as f64 / stats_window_started.elapsed().as_secs_f64(),
+                mbps = (bytes_this_window as f64 * 8.0 / 1_000_000.0) / stats_window_started.elapsed().as_secs_f64(),
+                rtt_ms = stats.path.rtt.as_secs_f64() * 1000.0,
+                cwnd = stats.path.cwnd,
+                congestion_events = stats.path.congestion_events,
+                lost_packets = stats.path.lost_packets,
+                lost_bytes = stats.path.lost_bytes,
+                "video stream stats"
+            );
+            frames_this_window = 0;
+            bytes_this_window = 0;
+            stats_window_started = Instant::now();
         }
     }
     input_task.abort();
+    tracing::info!(
+        total_frames_sent,
+        total_bytes_sent,
+        alive = ?session_started.elapsed(),
+        "connection handler exiting"
+    );
 
     Ok(())
 }

@@ -122,6 +122,7 @@ impl crate::InputInjector for WlrPointer {
         // Wayland client requests are just buffered writes to a local
         // socket, not blocking syscalls — fine to call directly here, same
         // reasoning as the uinput backends.
+        tracing::trace!(?event, "wlr pointer: injecting");
         match event {
             InputEvent::PointerMove { x, y } => {
                 let x = x.round().clamp(0.0, self.width.max(1) as f32 - 1.0) as u32;
@@ -154,7 +155,15 @@ impl crate::InputInjector for WlrPointer {
             }
             InputEvent::Key { .. } => {} // not this backend's job — see LinuxInjector
         }
+        let flush_started = std::time::Instant::now();
         self.conn.flush()?;
+        let flush_elapsed = flush_started.elapsed();
+        if flush_elapsed > std::time::Duration::from_millis(50) {
+            // A blocked socket write to the compositor would show up here —
+            // a real (if unlikely) candidate for "input stopped working"
+            // freezes, distinct from anything on the network/decode side.
+            tracing::warn!(?flush_elapsed, "wayland connection flush took unusually long");
+        }
         Ok(())
     }
 }

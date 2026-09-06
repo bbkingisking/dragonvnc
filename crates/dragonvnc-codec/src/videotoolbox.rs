@@ -183,9 +183,12 @@ impl Default for VideoToolboxDecoder {
 
 impl Decoder for VideoToolboxDecoder {
     fn decode(&mut self, payload: &[u8], width: u32, height: u32) -> anyhow::Result<DecodedFrame> {
+        let started = std::time::Instant::now();
         let nals = parse_nals(payload);
+        tracing::trace!(payload_len = payload.len(), nal_count = nals.len(), "decoding payload");
 
-        if self.session.is_none() {
+        let is_first_decode = self.session.is_none();
+        if is_first_decode {
             self.initialize(&nals, width, height)?;
         }
         anyhow::ensure!(
@@ -296,6 +299,23 @@ impl Decoder for VideoToolboxDecoder {
             let (pixels, stride) = result
                 .into_inner()
                 .ok_or_else(|| anyhow::anyhow!("decode completed with no callback invocation"))??;
+            let elapsed = started.elapsed();
+            // The very first call includes `initialize()` — a real,
+            // consistently ~100ms one-time session-creation cost (measured
+            // live against real hardware), not a decode stall. Warning on
+            // it every single connection would just teach whoever reads
+            // the logs to ignore this warning, so it's excluded here.
+            if elapsed > std::time::Duration::from_millis(100) && !is_first_decode {
+                // Comment above says this call is synchronous — if it's
+                // also slow, that's VideoToolbox itself stalling (thermal
+                // throttling, session churn) rather than anything on the
+                // network side. Worth distinguishing from a network-side
+                // freeze, which is why this is logged from here rather
+                // than only timed by the caller.
+                tracing::warn!(?elapsed, "VideoToolbox decode_frame took unusually long");
+            } else if is_first_decode {
+                tracing::debug!(?elapsed, "first decode (includes one-time session creation)");
+            }
             Ok(DecodedFrame { pixels, format: PixelFormat::Bgra, stride })
         }
     }

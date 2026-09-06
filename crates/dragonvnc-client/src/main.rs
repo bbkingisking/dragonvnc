@@ -46,6 +46,23 @@ struct Args {
     move_to: Option<(f32, f32)>,
 }
 
+/// `RUST_LOG` still controls everything if set (`try_from_default_env`
+/// parses it exactly as `tracing_subscriber::fmt::init()` would); this only
+/// picks a saner *default* when it isn't. Plain `info` alone is unreadable
+/// here: wgpu logs an INFO line per submitted frame
+/// (`wgpu_core::device::resource: Device::maintain: waiting for submission
+/// index N`) and DEBUG-level wgpu_hal/naga dump full shader translations
+/// and pipeline capability structs — real noise this crate's own debug
+/// instrumentation would otherwise be buried under. Downgraded here rather
+/// than left as "just set RUST_LOG more precisely", since the whole point
+/// of this is to have useful logs already on by default when something
+/// goes wrong, not to require already knowing what to ask for.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
 fn parse_xy(s: &str) -> Result<(f32, f32), String> {
     let (x, y) = s.split_once(',').ok_or_else(|| "expected \"x,y\"".to_string())?;
     Ok((
@@ -55,7 +72,7 @@ fn parse_xy(s: &str) -> Result<(f32, f32), String> {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let args = Args::parse();
     let code = PairingCode::from(args.code);
 

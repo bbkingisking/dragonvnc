@@ -8,6 +8,7 @@
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 use winit::event_loop::EventLoopProxy;
@@ -84,7 +85,10 @@ pub async fn run_dump_raw(addr: SocketAddr, code: PairingCode, dump_path: PathBu
     loop {
         let header = match recv_frame_header(&mut video_recv).await {
             Ok(h) => h,
-            Err(_) => break,
+            Err(e) => {
+                tracing::info!(error = %e, "video stream ended");
+                break;
+            }
         };
         let mut payload = vec![0u8; header.payload_len as usize];
         video_recv.read_exact(&mut payload).await?;
@@ -141,26 +145,89 @@ pub async fn run_windowed(
         // thread, over `input_rx`) to the server. Runs independently of
         // the video-decode loop below so neither can block the other.
         let input_task = tokio::spawn(async move {
+            let mut sent_count = 0u64;
             while let Some(event) = input_rx.recv().await {
-                if send_msg(&mut ctrl_send, &ControlMessage::Input(event)).await.is_err() {
-                    break; // connection gone
+                tracing::trace!(?event, "forwarding input event");
+                if let Err(e) = send_msg(&mut ctrl_send, &ControlMessage::Input(event)).await {
+                    // Not silent: if input stops working while video is
+                    // still arriving (or vice versa), this is the log line
+                    // that tells you which side actually died first.
+                    tracing::info!(error = %e, sent_count, "control stream ended, stopping input forwarding");
+                    break;
                 }
+                sent_count += 1;
             }
         });
 
         let mut video_recv = connection.accept_uni().await?;
         let mut decoder: Option<Box<dyn Decoder>> = None;
+        let session_started = Instant::now();
+        let mut stats_window_started = Instant::now();
+        let mut frames_this_window = 0u32;
+        let mut bytes_this_window = 0u64;
+        let mut total_frames = 0u64;
+        let mut total_bytes = 0u64;
         loop {
             let header = match recv_frame_header(&mut video_recv).await {
                 Ok(h) => h,
-                Err(_) => break, // stream closed, server went away
+                Err(e) => {
+                    // This used to be a silent `break` — from the outside,
+                    // indistinguishable from "the window just froze": video
+                    // stops updating, nothing logged, nothing shown. Now it
+                    // at least ends up in the log, and (via the early
+                    // return below) in the window's title.
+                    tracing::info!(
+                        error = %e,
+                        total_frames,
+                        total_bytes,
+                        alive = ?session_started.elapsed(),
+                        "video stream ended"
+                    );
+                    let _ = proxy.send_event(RenderEvent::NetworkError(format!(
+                        "video stream ended: {e}"
+                    )));
+                    input_task.abort();
+                    return Ok(());
+                }
             };
             let mut payload = vec![0u8; header.payload_len as usize];
             video_recv.read_exact(&mut payload).await?;
+            let is_first_decode = decoder.is_none();
             if decoder.is_none() {
                 decoder = Some(make_decoder(header.codec)?);
             }
+            let decode_started = Instant::now();
             let frame = decoder.as_mut().unwrap().decode(&payload, header.width, header.height)?;
+            let decode_elapsed = decode_started.elapsed();
+            // The first decode call on a fresh decoder instance routinely
+            // includes one-time session setup (measured live: VideoToolbox
+            // takes ~100ms just to stand up its decompression session) —
+            // not a stall, so it's excluded from the warning to avoid
+            // crying wolf on every single connection.
+            if decode_elapsed > Duration::from_millis(100) && !is_first_decode {
+                tracing::warn!(?decode_elapsed, width = header.width, height = header.height, "decode took unusually long");
+            }
+
+            total_frames += 1;
+            total_bytes += payload.len() as u64;
+            frames_this_window += 1;
+            bytes_this_window += payload.len() as u64;
+            if stats_window_started.elapsed() >= Duration::from_secs(5) {
+                let stats = connection.stats();
+                tracing::info!(
+                    fps = frames_this_window as f64 / stats_window_started.elapsed().as_secs_f64(),
+                    mbps = (bytes_this_window as f64 * 8.0 / 1_000_000.0) / stats_window_started.elapsed().as_secs_f64(),
+                    rtt_ms = stats.path.rtt.as_secs_f64() * 1000.0,
+                    cwnd = stats.path.cwnd,
+                    congestion_events = stats.path.congestion_events,
+                    lost_packets = stats.path.lost_packets,
+                    "video stream stats"
+                );
+                frames_this_window = 0;
+                bytes_this_window = 0;
+                stats_window_started = Instant::now();
+            }
+
             let sent = proxy.send_event(RenderEvent::Frame {
                 width: header.width,
                 height: header.height,
@@ -169,6 +236,7 @@ pub async fn run_windowed(
                 pixels: frame.pixels,
             });
             if sent.is_err() {
+                tracing::info!("render event loop is gone, stopping video decode loop");
                 break; // window closed
             }
         }
@@ -178,6 +246,7 @@ pub async fn run_windowed(
     .await;
 
     if let Err(e) = result {
+        tracing::error!(error = %e, "run_windowed ended with an error");
         let _ = proxy.send_event(RenderEvent::NetworkError(e.to_string()));
     }
 }

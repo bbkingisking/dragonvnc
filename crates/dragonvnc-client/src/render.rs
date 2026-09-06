@@ -306,10 +306,18 @@ impl ApplicationHandler<RenderEvent> for App {
             }
             RenderEvent::NetworkError(e) => {
                 tracing::error!(error = %e, "network task ended");
-                self.last_error = Some(e);
                 if let Some(gfx) = &self.gfx {
+                    // The window itself is the only thing left to tell a
+                    // person anything — without this, "the network task
+                    // died" and "the app just froze" look identical from
+                    // in front of the screen. This won't catch every case
+                    // (a hard crash of the whole process shows nothing
+                    // either), but a live window whose network side quietly
+                    // gave up now says so instead of just going stale.
+                    gfx.window.set_title(&format!("dragonvnc — disconnected: {e}"));
                     gfx.window.request_redraw();
                 }
+                self.last_error = Some(e);
             }
         }
     }
@@ -326,7 +334,38 @@ impl ApplicationHandler<RenderEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 let Some(gfx) = &mut self.gfx else { return };
-                let Ok(frame) = gfx.surface.get_current_texture() else { return };
+                let frame = match gfx.surface.get_current_texture() {
+                    Ok(frame) => frame,
+                    // This used to be `let Ok(frame) = ... else { return }`
+                    // — silently dropping the redraw on *any* error,
+                    // including `Lost`/`Outdated` (e.g. after a resize, a
+                    // Spaces switch, or the window being occluded then
+                    // un-occluded on macOS). Once the surface is in that
+                    // state it stays broken until reconfigured, so every
+                    // future frame's `request_redraw` would silently no-op
+                    // forever — the window visibly frozen on its last good
+                    // frame while video keeps decoding in the background.
+                    // That's a real, distinct "freeze" bug, not just a
+                    // missing log line: reconfigure and try again.
+                    Err(e @ (wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated)) => {
+                        tracing::warn!(error = %e, "wgpu surface lost/outdated, reconfiguring");
+                        gfx.surface.configure(&gfx.device, &gfx.config);
+                        gfx.window.request_redraw();
+                        return;
+                    }
+                    Err(e) => {
+                        // `Timeout` is common and harmless (e.g. the window
+                        // is occluded/minimized) — not worth more than
+                        // debug. Anything else (`OutOfMemory`, `Other`) is
+                        // unexpected; surface loudly.
+                        if matches!(e, wgpu::SurfaceError::Timeout) {
+                            tracing::debug!(error = %e, "surface acquire timed out, skipping this redraw");
+                        } else {
+                            tracing::warn!(error = %e, "surface acquire failed, skipping this redraw");
+                        }
+                        return;
+                    }
+                };
                 let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
                 let mut encoder = gfx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 {
@@ -354,8 +393,18 @@ impl ApplicationHandler<RenderEvent> for App {
                         pass.draw(0..3, 0..1);
                     }
                 }
+                let present_started = std::time::Instant::now();
                 gfx.queue.submit(Some(encoder.finish()));
                 frame.present();
+                let present_elapsed = present_started.elapsed();
+                if present_elapsed > std::time::Duration::from_millis(100) {
+                    // `Fifo` present mode blocks for vsync, so some wait is
+                    // normal — but this long means something's actually
+                    // stuck (GPU driver, compositor, or the window fully
+                    // occluded/minimized long enough to matter), not just
+                    // "waiting one frame".
+                    tracing::warn!(?present_elapsed, "submit+present took unusually long");
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some((x, y)) = self.to_remote_coords(position.x, position.y) {

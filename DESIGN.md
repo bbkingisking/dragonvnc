@@ -363,3 +363,101 @@ forwarded back over the same connection → injected into the Linux
 desktop via Wayland virtual-pointer + uinput. Every arrow in that chain
 has now been verified against real hardware, not assumed from a
 successful compile.
+
+## Diagnostics pass: instrumenting both sides for "it sometimes freezes"
+
+A live session freezing intermittently, with no other symptom to go on,
+is exactly the kind of report that's unfixable from a description alone —
+so rather than guess, this pass adds timing/throughput instrumentation at
+every real handoff point on both server and client, so the *next*
+occurrence leaves a trail: which stage was slow, whether frames were
+still arriving, whether the network path itself was healthy.
+
+**What got added**, roughly stage by stage:
+- Server: per-frame timing around `encode()` and the QUIC video-frame
+  write, warning if either exceeds ~200ms (a hardware encoder turning a
+  frame around, or a LAN write, in the hundreds of milliseconds is
+  anomalous, not "just idle screen" — capture's own wait time is *not*
+  warned on, since PipeWire is damage-driven and long idle gaps are
+  normal). A 5s periodic stats line (fps, mbps, and — via
+  `quinn::Connection::stats()` — RTT, congestion window, congestion
+  events, lost packets/bytes) gives a live health readout of the QUIC
+  path itself, not just the frames on top of it. Same periodic-stats
+  treatment on the client's decode loop, plus per-decode timing.
+- Capture (`dragonvnc-capture::pipewire`): every previously-silent
+  early-return in the `process` callback (empty chunk, unsupported
+  format, no mapped pointer, no buffer ready) now increments a drop
+  counter and logs its specific reason at debug; a 5s periodic
+  fps/dropped-count line. `next_frame()` checks the channel's queue
+  depth on every receive and warns past 5 — the only way backpressure
+  from a slow encode/send downstream would otherwise be visible (the
+  channel is unbounded, so a stuck consumer doesn't block, it just grows
+  memory silently).
+- Encode/decode internals (`vaapi`, `videotoolbox`): per-stage timing
+  (sws_scale / hwframe transfer / send_frame on the encode side; the
+  whole `decode_frame` call on the decode side), warning past ~50-100ms —
+  low enough that a real GPU/driver stall shows up, high enough that
+  normal per-frame cost doesn't. The very first decode call is exempted
+  from that warning: it measurably includes one-time
+  `VTDecompressionSession` creation (~100ms on this M1, confirmed live),
+  which would otherwise warn on *every single connection* and teach
+  whoever's reading the log to ignore the warning.
+- Input injection (`wlr_pointer`, `uinput`): every injected event logged
+  at trace, plus timing around the actual syscall (`wl_display_flush`,
+  `write(2)` to `/dev/uinput`) warning past 50ms — distinguishes "the
+  compositor/kernel didn't take the input" from "the network never
+  delivered it" or "the server never received it", three previously
+  indistinguishable failure sites.
+- Every place that used to fail silently now logs why: the server's
+  video-send and control-stream loops, the client's video-recv and
+  input-forwarding loops all used to `break` on error with no log line —
+  from outside, indistinguishable from an actual freeze. They now log
+  the real error and (client-side) surface it through a `RenderEvent` so
+  the *window itself* shows "disconnected: \<reason\>" in its title bar
+  instead of just going stale with the last good frame on screen forever.
+
+**A real bug this surfaced immediately**, live, during verification (not
+hypothetical): the wgpu render loop's `RedrawRequested` handler did
+`let Ok(frame) = surface.get_current_texture() else { return }` —
+silently no-op on *any* acquire error, including `Lost`/`Outdated`. Once
+the surface enters that state (a resize, a Spaces switch, the window
+being occluded and un-occluded on macOS) it stays broken until
+reconfigured, so every future `request_redraw` would silently do nothing
+forever: the window frozen on its last good frame while video keeps
+decoding in the background, invisibly. That's a real, distinct freeze
+bug this instrumentation pass fixed outright (reconfigure-and-retry on
+`Lost`/`Outdated`, log-and-skip on `Timeout`/`OutOfMemory`), not just
+made more visible.
+
+**Also caught live, by the instrumentation itself, mid-verification**: a
+fresh connection attempt hung completely at the capture-start stage.
+Tracing it down (not guessing) found `xdg-desktop-portal-wlr` had shelled
+out to `slurp` — its interactive region-picker — and was blocked waiting
+for a human to click, because the persisted `restore_token` had gone
+stale (the portal's own log showed a `no wl_output` error a few hours
+earlier, from a transient zero-output state, which appears to have
+invalidated the grant). For an unattended server, nobody is ever present
+to answer that picker, so `open_portal` would have hung forever — a
+genuine, previously-invisible cause of "sometimes freezes," caught in
+the act rather than inferred. Fixed with a 30s timeout around portal
+setup that fails loudly with a specific, actionable message (check for
+and kill a stuck picker process, or delete the token to force a fresh
+grant) instead of hanging indefinitely.
+
+**A second-order bug the new logging almost introduced**: the "receiver
+gone" debug log added to the pipewire capture callback fired on *every*
+subsequent buffer once a session ended, and that thread has no shutdown
+signal (a pre-existing, documented gap — it runs for as long as the
+compositor keeps damaging the screen, i.e. forever). Caught in the same
+live verification pass before it shipped: fixed to log that transition
+exactly once per capture thread, then go silent, so a long-lived server
+across many past connections doesn't accumulate unbounded log growth
+from sessions nobody's watching anymore.
+
+**Verification**: every change here that could be built and run locally
+was — `cargo test --workspace` on both machines (including the two
+real-hardware round-trip tests, VAAPI encode and VideoToolbox decode,
+both still passing), plus live end-to-end connections against the real
+Linux server from the real Mac client, both before and after the fixes
+above, reading the actual log output rather than assuming the new lines
+would look like this comment says they should.
