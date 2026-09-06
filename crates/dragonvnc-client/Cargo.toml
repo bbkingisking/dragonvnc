@@ -13,8 +13,13 @@ dragonvnc-net = { path = "../dragonvnc-net" }
 quinn = "0.11"
 dragonvnc-proto = { path = "../dragonvnc-proto" }
 dragonvnc-codec = { path = "../dragonvnc-codec" }
+dragonvnc-capture = { path = "../dragonvnc-capture" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
+winit = "0.30"
+wgpu = "22"
+pollster = "1"
+bytes.workspace = true

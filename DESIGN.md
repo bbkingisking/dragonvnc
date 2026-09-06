@@ -262,3 +262,104 @@ address, while the hardcoded IP used for the dragonvnc connection attempts
 was stale. The LuLu removal was a genuine, worthwhile fix in its own right
 (a system extension left silently enforcing after its app was deleted,
 only fully clearing on reboot), just not actually this session's blocker.
+
+## Milestone 6: real render window + local input capture
+
+Every prior milestone proved the pipeline end-to-end at the byte level
+(decoded frames counted, dimensions logged, pixel diffs against a saved
+PNG) but never actually put pixels on a screen or read a real mouse/
+keyboard. This milestone replaces the demo client's headless decode loop
+with an actual window — real HEVC frames rendered live, real local input
+captured and forwarded — so the client is, for the first time, something
+a person could sit in front of and use.
+
+**Architecture.** winit requires the main thread on macOS, so the client
+is restructured around that constraint rather than around the async
+runtime: `main()` is no longer `async fn`. winit's `EventLoop` owns the
+main thread; all networking (connect, pair, control handshake, decode
+loop) moves to a dedicated background OS thread running its own
+`tokio::runtime::Runtime`. The two sides are bridged in both directions:
+network → render via `winit::event_loop::EventLoopProxy<RenderEvent>`
+(delivers decoded `Frame`s and `NetworkError`s into winit's event loop,
+the only channel winit provides for injecting events from outside),
+render → network via a plain `tokio::sync::mpsc::unbounded_channel`
+(`UnboundedSender::send` is sync, so winit's event handlers — which are
+not async — can push `InputEvent`s onto it directly). The client crate
+is split along this seam: `render.rs` (window, wgpu state, the
+`ApplicationHandler` impl, local input capture), `network.rs` (connect/
+pair/handshake, the decode loop, the input-forwarding task), `keymap.rs`
+(winit physical key → evdev keycode), `main.rs` now just wires the two
+together and owns the CLI args.
+
+**Rendering.** wgpu (Metal backend on this hardware) draws a single
+fullscreen triangle textured with the latest decoded frame — the
+standard no-vertex-buffer blit trick (a WGSL vertex shader synthesizes
+clip-space positions and UVs from `vertex_index` alone). The texture's
+wgpu format is chosen per frame from `PixelFormat` (`Rgba8Unorm` or
+`Bgra8Unorm`) rather than assumed, matching the codec crate's existing
+refusal to mislabel BGRA as RGBA (Milestone 5) — VideoToolbox's real
+hardware output is BGRA, the `PassthroughCodec` test-pattern path is
+RGBA, and the shader must not care which. The texture is recreated only
+when size or format actually changes; otherwise each `Frame` event is a
+plain `write_texture` upload.
+
+**Input capture.** winit's `WindowEvent`s map directly onto the wire
+protocol's existing `InputEvent` variants: `CursorMoved` → `PointerMove`
+(after scaling from window-physical-pixels to the remote display's own
+resolution — independent per-axis scale factors, computed against
+`remote_size` as learned from the first decoded frame's dimensions, so a
+window of any size/aspect still addresses the full remote desktop),
+`MouseInput` → `PointerButton`, `MouseWheel` → `Scroll` (line-delta
+events scaled by a constant, pixel-delta events passed through as-is),
+`KeyboardInput` → `Key` via `keymap::to_evdev`. This reuses the protocol
+unchanged — no new wire types were needed, only a new producer of the
+same `InputEvent`s the `--move-to` scripted-test path already sent in
+Milestone 4.
+
+**Verification.** Built up in stages against the real hardware rather
+than trusted on the first attempt to compile:
+- A bare clear-color window (no network yet) confirmed the
+  winit-owns-main-thread + wgpu-Metal setup actually opens and holds a
+  window on this machine before any networking was layered on top,
+  screenshotted via `screencapture` to confirm the clear color landed.
+- A synthetic quadrant-pattern texture (four solid-color quadrants
+  uploaded via `write_texture`, no video stream involved) confirmed the
+  textured fullscreen-triangle blit itself — format selection, UV
+  orientation, upload path — independent of decode correctness, again
+  confirmed by screenshot and pixel inspection rather than "it compiled."
+- Only then was it pointed at the real server: with the Linux box
+  running `--source pipewire --codec vaapi-hevc`, the client connected,
+  paired, and rendered the **actual live Linux desktop** in the window —
+  confirmed by `screencapture` on the Mac and comparing the captured
+  window content against what was on the Linux screen at the time (this
+  is the first milestone where a human could look at the client window
+  and see the real remote desktop, not a log line asserting frames
+  decoded).
+- Input forwarding was verified the same way Milestone 4 verified
+  server-side injection: two independent `--move-to` runs through the
+  *new* render/network code path, at (200,200) and (1700,900), both
+  landing the remote cursor within ~5px of target — matching Milestone
+  4's established precision and confirming the new render-thread →
+  mpsc → network-thread → control-stream path carries input correctly,
+  not just that the old headless path did.
+
+No real bugs were found in this milestone beyond the wgpu 22 API-naming
+mismatches (`TexelCopyTextureInfo`/`TexelCopyBufferLayout` guessed from a
+newer version; this workspace pins 22, whose actual names are
+`ImageCopyTexture`/`ImageDataLayout`) and a `StackBlock`-shaped hazard
+that didn't recur here but is worth naming for anyone touching this code
+next to VideoToolbox's: closures crossing into Objective-C-block-based
+APIs must be `Fn`, not `FnMut`, so any per-call mutable state has to go
+through a `Cell`/`RefCell` captured by shared reference — already fixed
+in Milestone 5's decoder, unchanged here, just relevant background for
+why `render.rs`'s texture-swap logic is structured the way it is.
+
+With this milestone, the full loop the project set out to build is
+real end to end and usable by a person: live Linux desktop → PipeWire
+capture → VAAPI HEVC hardware encode → QUIC over a real LAN →
+VideoToolbox HEVC hardware decode → a real window on the Mac showing
+the desktop → real local mouse/keyboard captured in that window →
+forwarded back over the same connection → injected into the Linux
+desktop via Wayland virtual-pointer + uinput. Every arrow in that chain
+has now been verified against real hardware, not assumed from a
+successful compile.

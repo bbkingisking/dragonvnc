@@ -1,34 +1,25 @@
-//! Demo/debug client binary — companion to dragonvnc-server. Proves the
-//! same pipeline from the receiving end: pairing, control handshake, then
-//! decoding the video stream — real VideoToolbox HEVC hardware decode on
-//! macOS (see `dragonvnc_codec::videotoolbox`), `PassthroughCodec` for the
-//! test-pattern path. No real window/GPU render yet (that's the
-//! `wgpu`/`winit` milestone — see DESIGN.md "Status"); this decodes each
-//! frame and reports throughput, to prove the bytes arriving are correct
-//! and complete.
+//! dragonvnc client. Connects, pairs, and either renders the video stream
+//! in a real window (the default) — decoding via real VideoToolbox HEVC
+//! hardware decode on macOS (see `dragonvnc_codec::videotoolbox`),
+//! `PassthroughCodec` for the test-pattern path — and forwards window
+//! input back to the server, or (`--dump-raw`) just writes payloads to a
+//! file headlessly for inspection with an independent tool.
+//!
+//! winit owns the main thread (required on macOS); all networking runs on
+//! a background thread with its own Tokio runtime, bridged via an
+//! `EventLoopProxy` (network → render: decoded frames) and an unbounded
+//! channel (render → network: input events) — see `render`/`network`.
 
-use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr};
+mod keymap;
+mod network;
+mod render;
+
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use dragonvnc_codec::Decoder;
-use dragonvnc_net::{endpoint, pairing::PairingCode};
-use dragonvnc_proto::{ControlMessage, FrameHeader, InputEvent, VideoCodec, PROTOCOL_VERSION};
-
-fn make_decoder(codec: VideoCodec) -> anyhow::Result<Box<dyn Decoder>> {
-    match codec {
-        VideoCodec::TestPatternRgba => Ok(Box::new(dragonvnc_codec::PassthroughCodec)),
-        #[cfg(target_os = "macos")]
-        VideoCodec::Hevc => Ok(Box::new(dragonvnc_codec::videotoolbox::VideoToolboxDecoder::new())),
-        #[cfg(not(target_os = "macos"))]
-        VideoCodec::Hevc => anyhow::bail!(
-            "no HEVC decoder on this platform yet (VideoToolbox is macOS-only); pass --dump-raw \
-             to inspect the stream with an independent tool instead"
-        ),
-        VideoCodec::Av1 => anyhow::bail!("no AV1 decoder implemented yet"),
-    }
-}
+use dragonvnc_net::pairing::PairingCode;
+use winit::event_loop::EventLoop;
 
 #[derive(Parser)]
 struct Args {
@@ -40,160 +31,59 @@ struct Args {
     #[arg(long)]
     code: String,
 
-    /// Write the raw video payloads to this file instead of decoding them
-    /// — useful for inspecting the stream with an independent tool (e.g.
-    /// `ffprobe -f hevc dump.hevc`) instead of this binary's own decoder.
+    /// Write the raw video payloads to this file instead of decoding/
+    /// rendering them — useful for inspecting the stream with an
+    /// independent tool (e.g. `ffprobe -f hevc dump.hevc`). Headless: no
+    /// window opens in this mode.
     #[arg(long)]
     dump_raw: Option<PathBuf>,
 
     /// Send one synthetic pointer move to "x,y" right after the control
-    /// handshake, then a left click. There's no real client UI generating
-    /// input yet (see DESIGN.md) — this is how real server-side input
-    /// injection gets verified for now: send a scripted event and check
-    /// the compositor's actual cursor position moved (e.g. via
-    /// `swaymsg -t get_seats`).
+    /// handshake, then a left click, in addition to whatever real input
+    /// the window sends — handy for scripted testing without needing to
+    /// actually click.
     #[arg(long, value_parser = parse_xy)]
     move_to: Option<(f32, f32)>,
 }
 
 fn parse_xy(s: &str) -> Result<(f32, f32), String> {
-    let (x, y) = s
-        .split_once(',')
-        .ok_or_else(|| "expected \"x,y\"".to_string())?;
+    let (x, y) = s.split_once(',').ok_or_else(|| "expected \"x,y\"".to_string())?;
     Ok((
         x.trim().parse().map_err(|_| "bad x".to_string())?,
         y.trim().parse().map_err(|_| "bad y".to_string())?,
     ))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
     let code = PairingCode::from(args.code);
 
-    let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
-    let ep = endpoint::client_endpoint_for_pairing(bind_addr)?;
-    let connection = ep.connect(args.addr, "dragonvnc")?.await?;
-    tracing::info!(peer = %connection.remote_address(), "connected");
-
-    let (mut send, mut recv) = connection.open_bi().await?;
-    let server_fingerprint =
-        dragonvnc_net::pairing::run(&connection, &mut send, &mut recv, &code)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("server presented no certificate — pairing cannot be trusted"))?;
-    tracing::info!(
-        fingerprint = %hex(&server_fingerprint),
-        "pairing succeeded — in the real client this gets pinned to disk \
-         so future connections skip the code (see dragonvnc-net::TrustStore, \
-         already implemented and tested; not yet wired into this CLI)"
-    );
-
-    let (mut ctrl_send, mut ctrl_recv) = connection.open_bi().await?;
-    send_msg(
-        &mut ctrl_send,
-        &ControlMessage::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_name: "dragonvnc-client-demo".into(),
-        },
-    )
-    .await?;
-    let welcome: ControlMessage = recv_msg(&mut ctrl_recv).await?;
-    let ControlMessage::Welcome { server_name, displays, .. } = welcome else {
-        anyhow::bail!("expected Welcome, got {welcome:?}");
-    };
-    tracing::info!(%server_name, ?displays, "server said welcome");
-
-    if let Some((x, y)) = args.move_to {
-        send_msg(&mut ctrl_send, &ControlMessage::Input(InputEvent::PointerMove { x, y })).await?;
-        send_msg(
-            &mut ctrl_send,
-            &ControlMessage::Input(InputEvent::PointerButton {
-                button: dragonvnc_proto::PointerButton::Left,
-                pressed: true,
-            }),
-        )
-        .await?;
-        send_msg(
-            &mut ctrl_send,
-            &ControlMessage::Input(InputEvent::PointerButton {
-                button: dragonvnc_proto::PointerButton::Left,
-                pressed: false,
-            }),
-        )
-        .await?;
-        tracing::info!(x, y, "sent synthetic pointer move + left click");
+    if let Some(dump_path) = args.dump_raw {
+        // Headless: no window, so no need for winit to own the thread —
+        // a plain tokio runtime is enough.
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(network::run_dump_raw(args.addr, code, dump_path));
     }
 
-    let mut video_recv = connection.accept_uni().await?;
-    // Which decoder to use depends on the codec the server actually sends
-    // (in the first frame's header) — built lazily so a --dump-raw run
-    // never needs one at all.
-    let mut decoder: Option<Box<dyn Decoder>> = None;
-    let mut dump_file = args.dump_raw.map(std::fs::File::create).transpose()?;
-    let mut frames_this_second = 0u32;
-    let mut bytes_this_second = 0u64;
-    let mut window_start = std::time::Instant::now();
+    let event_loop = EventLoop::<render::RenderEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    loop {
-        let header = match recv_frame_header(&mut video_recv).await {
-            Ok(h) => h,
-            Err(_) => break, // stream closed, server went away
-        };
-        let mut payload = vec![0u8; header.payload_len as usize];
-        video_recv.read_exact(&mut payload).await?;
-
-        if let Some(f) = &mut dump_file {
-            f.write_all(&payload)?;
-        } else {
-            if decoder.is_none() {
-                decoder = Some(make_decoder(header.codec)?);
+    let addr = args.addr;
+    let move_to = args.move_to;
+    std::thread::Builder::new().name("dragonvnc-network".into()).spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to start network runtime");
+                return;
             }
-            let _frame = decoder.as_mut().unwrap().decode(&payload, header.width, header.height)?;
-        }
+        };
+        rt.block_on(network::run_windowed(addr, code, move_to, proxy, input_rx));
+    })?;
 
-        frames_this_second += 1;
-        bytes_this_second += payload.len() as u64;
-        if window_start.elapsed() >= std::time::Duration::from_secs(1) {
-            tracing::info!(
-                fps = frames_this_second,
-                mbps = (bytes_this_second as f64 * 8.0 / 1_000_000.0),
-                "video stats"
-            );
-            frames_this_second = 0;
-            bytes_this_second = 0;
-            window_start = std::time::Instant::now();
-        }
-    }
-
+    let mut app = render::App::new(input_tx);
+    event_loop.run_app(&mut app)?;
     Ok(())
-}
-
-async fn recv_frame_header(stream: &mut quinn::RecvStream) -> anyhow::Result<FrameHeader> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(dragonvnc_proto::decode(&buf)?)
-}
-
-async fn send_msg(stream: &mut quinn::SendStream, msg: &ControlMessage) -> anyhow::Result<()> {
-    let bytes = dragonvnc_proto::encode(msg)?;
-    stream.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    Ok(())
-}
-
-async fn recv_msg(stream: &mut quinn::RecvStream) -> anyhow::Result<ControlMessage> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    Ok(dragonvnc_proto::decode(&buf)?)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
