@@ -90,6 +90,14 @@ fn default_identity_path() -> PathBuf {
         .join("server_identity.bin")
 }
 
+#[cfg(target_os = "linux")]
+fn default_screencast_token_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dragonvnc")
+        .join("screencast_restore_token")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -156,7 +164,9 @@ async fn make_source(
     match source {
         Source::TestPattern => Ok(Box::new(TestPatternSource::new(width, height, fps))),
         #[cfg(target_os = "linux")]
-        Source::Pipewire => Ok(Box::new(dragonvnc_capture::pipewire::PipeWireSource::new().await?)),
+        Source::Pipewire => Ok(Box::new(
+            dragonvnc_capture::pipewire::PipeWireSource::new(&default_screencast_token_path()).await?,
+        )),
         #[cfg(not(target_os = "linux"))]
         Source::Pipewire => anyhow::bail!(
             "--source pipewire is Linux-only (PipeWire/XDG portal); this build was compiled for a different target"

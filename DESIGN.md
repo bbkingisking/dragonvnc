@@ -124,23 +124,35 @@ buffers aren't always tightly-packed RGBA the way the test pattern is;
 negotiation, which keeps the compositor from proposing DMA-BUF; importing
 DMA-BUF for a zero-copy GPU-to-GPU path is a follow-up optimization.
 
-Verification here is partial and it's important to be honest about why:
-this reference machine's live `sway` session currently has **zero physical
-outputs attached** (it's genuinely headless right now) — which is
-representative of the real target use case, but means there is nothing to
-actually capture pixels from. What *is* verified: the capture code builds
-cleanly against the real installed `libpipewire`/portal stack, and a
-throwaway probe ran the full D-Bus portal handshake
-(`create_session`→`select_sources`→`start`) against the live
-`xdg-desktop-portal-wlr` instance and got back a real, specific error —
-`Invalid session` — once the portal discovered there was nothing to
-capture, with no hang and no panic. That confirms the wiring is
-structurally correct end to end up to the point where a real frame would
-start flowing. Actually receiving a frame needs either a monitor attached
-to this box, or a disposable nested headless-output compositor + its own
-portal instance for testing — deliberately not attempted here, since a
-second `xdg-desktop-portal-wlr` on the same session D-Bus risks colliding
-with the live one backing the user's actual desktop.
+First verification pass caught two real things, both fixed and then
+re-verified:
+
+- This reference machine's live `sway` session had **zero physical outputs
+  attached** at first (genuinely headless) — nothing to capture. A
+  throwaway probe still confirmed the wiring: it ran the full D-Bus portal
+  handshake (`create_session`→`select_sources`→`start`) against the live
+  `xdg-desktop-portal-wlr` and got back a real, specific, non-hanging error
+  (`Invalid session`) exactly when the portal discovered there was nothing
+  to capture. Once a monitor was attached, the same probe captured real
+  1920x1080 frames from the live desktop.
+- The portal's screen-picker is an interactive human-consent flow — right
+  for "an app asks to share your screen," wrong for an always-on server
+  with nobody sitting at the machine to click anything. First pass used
+  `PersistMode::DoNot`, so it asked every single time. Fixed: `PipeWireSource`
+  now persists the portal's `restore_token` to disk (`--source pipewire`'s
+  token path) and passes it back with `PersistMode::ExplicitlyRevoked`.
+
+Verified live end-to-end, twice, against the real desktop: first
+connection ever (no saved token) needed one interactive click on the
+picker, then captured, encoded (real VAAPI HEVC), and streamed real
+1920x1080 desktop content over real QUIC to the demo client — independently
+confirmed valid by `ffprobe`/`ffmpeg`. Second connection, same server, with
+the token now on disk: pairing → Welcome → streaming completed in under
+250ms with **zero interaction** — no picker, no delay — proving the
+one-time-consent model actually works, not just compiles. The picker will
+reappear only if the user revokes access from their desktop's privacy
+settings, same as any other persistent screen-share grant (Discord, OBS,
+etc.).
 
 Still stubbed: input injection (libei/CGEvent), ScreenCaptureKit (macOS
 capture — moot anyway, since macOS is the client-only platform here), and

@@ -15,8 +15,20 @@
 //! loop; it's bridged to this crate's async `FrameSource` by running that
 //! loop on a dedicated OS thread and forwarding completed frames over an
 //! unbounded channel.
+//!
+//! The portal's screen-picker is an interactive human-consent flow — fine
+//! for "an app asks to share your screen," wrong for an always-on remote
+//! desktop server, which needs to (re)start capture with nobody sitting at
+//! the machine to click anything. The portal's answer to that is a
+//! `restore_token`: authorize once interactively, persist the token it
+//! hands back, and pass it into every later `select_sources` call with
+//! `PersistMode::ExplicitlyRevoked` — the portal then restores the same
+//! grant silently, no picker, until the user revokes it from their
+//! desktop's privacy settings. That's what `new()` below does; only the
+//! very first-ever run (per `token_path`) needs a human present.
 
 use std::os::fd::OwnedFd;
+use std::path::Path;
 use std::time::Instant;
 
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, Stream as PortalStream};
@@ -39,12 +51,16 @@ pub struct PipeWireSource {
 }
 
 impl PipeWireSource {
-    /// Runs the portal's screen-picker flow (may show a compositor UI for
-    /// the user to choose a monitor, depending on the portal backend) and
-    /// starts capturing. Fails if there is nothing to capture — e.g. this
-    /// box's reference `sway` session has zero physical outputs attached.
-    pub async fn new() -> anyhow::Result<Self> {
-        let (stream_info, fd) = open_portal().await?;
+    /// `token_path` is where the portal's restore token gets persisted (see
+    /// module doc) — pass the same path across restarts so only the very
+    /// first run ever needs a human to click the picker. The first run
+    /// (nothing saved yet, or the saved token has been revoked/expired)
+    /// may show a compositor UI for the user to choose a monitor,
+    /// depending on the portal backend. Fails if there is nothing to
+    /// capture — e.g. this box's reference `sway` session was briefly
+    /// down to zero physical outputs attached during development.
+    pub async fn new(token_path: &Path) -> anyhow::Result<Self> {
+        let (stream_info, fd) = open_portal(token_path).await?;
         let node_id = stream_info.pipe_wire_node_id();
         tracing::info!(node_id, size = ?stream_info.size(), "screencast portal session started");
 
@@ -69,7 +85,16 @@ impl FrameSource for PipeWireSource {
     }
 }
 
-async fn open_portal() -> anyhow::Result<(PortalStream, OwnedFd)> {
+async fn open_portal(token_path: &Path) -> anyhow::Result<(PortalStream, OwnedFd)> {
+    // Absence (first run, or a stale/revoked token) just means the portal
+    // falls back to the interactive picker — not an error here.
+    let saved_token = std::fs::read_to_string(token_path).ok();
+    if saved_token.is_some() {
+        tracing::info!(path = %token_path.display(), "reusing saved screencast restore token, no picker expected");
+    } else {
+        tracing::info!(path = %token_path.display(), "no saved screencast restore token yet, picker expected");
+    }
+
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
     proxy
@@ -79,13 +104,26 @@ async fn open_portal() -> anyhow::Result<(PortalStream, OwnedFd)> {
                 .set_cursor_mode(CursorMode::Embedded)
                 .set_sources(enumflags2::BitFlags::from(SourceType::Monitor))
                 .set_multiple(false)
-                .set_persist_mode(PersistMode::DoNot),
+                .set_restore_token(saved_token.as_deref())
+                .set_persist_mode(PersistMode::ExplicitlyRevoked),
         )
         .await?;
     let response = proxy
         .start(&session, None, Default::default())
         .await?
         .response()?;
+
+    if let Some(token) = response.restore_token() {
+        if let Some(parent) = token_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(token_path, token) {
+            // Not fatal — capture still works this session, it'll just
+            // need the picker again next time.
+            tracing::warn!(error = %e, path = %token_path.display(), "failed to persist screencast restore token");
+        }
+    }
+
     let stream = response
         .streams()
         .first()
