@@ -16,7 +16,19 @@ pub struct EncodedFrame {
 
 pub trait Encoder: Send {
     fn codec(&self) -> VideoCodec;
-    fn encode(&mut self, frame: &RawFrame) -> anyhow::Result<EncodedFrame>;
+
+    /// Feeds one raw frame to the encoder. Real hardware encoders are
+    /// pipelined — a given call may emit zero packets (input queued,
+    /// nothing ready yet), exactly one (the common case once the pipeline
+    /// is warm), or in principle more than one, so callers must not assume
+    /// 1:1 and must keep sending frames to drain a non-empty pipeline.
+    fn encode(&mut self, frame: &RawFrame) -> anyhow::Result<Vec<EncodedFrame>>;
+
+    /// Signals end of stream and drains any packets still buffered in the
+    /// encoder's pipeline. Call once, after the last `encode()`.
+    fn flush(&mut self) -> anyhow::Result<Vec<EncodedFrame>> {
+        Ok(Vec::new())
+    }
 }
 
 pub trait Decoder: Send {
@@ -38,14 +50,17 @@ impl Encoder for PassthroughCodec {
         VideoCodec::TestPatternRgba
     }
 
-    fn encode(&mut self, frame: &RawFrame) -> anyhow::Result<EncodedFrame> {
-        Ok(EncodedFrame {
+    fn encode(&mut self, frame: &RawFrame) -> anyhow::Result<Vec<EncodedFrame>> {
+        Ok(vec![EncodedFrame {
             codec: VideoCodec::TestPatternRgba,
             keyframe: true, // every frame is independently decodable
             payload: frame.rgba.clone(),
-        })
+        }])
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod vaapi;
 
 impl Decoder for PassthroughCodec {
     fn decode(&mut self, payload: &[u8], width: u32, height: u32) -> anyhow::Result<bytes::Bytes> {
@@ -73,7 +88,8 @@ mod tests {
         };
         let mut codec = PassthroughCodec;
         let encoded = codec.encode(&frame).unwrap();
-        let decoded = codec.decode(&encoded.payload, 1, 2).unwrap();
+        assert_eq!(encoded.len(), 1);
+        let decoded = codec.decode(&encoded[0].payload, 1, 2).unwrap();
         assert_eq!(decoded, rgba);
     }
 }

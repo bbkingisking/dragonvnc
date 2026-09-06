@@ -53,8 +53,12 @@ hardware: VCN 2.x has a hardware HEVC encoder (8/10-bit, up to 4K) but no AV1
 encode block at all — that shipped with RDNA3/VCN4 (RX 7000-series). Linux
 encode path is therefore VAAPI against Mesa's `radeonsi`/RADV driver (the
 open-source stack, not AMD's older closed AMF), targeting VCN 2.2's HEVC
-profile. Confirm at implementation time with `vainfo` on the actual box:
-expect `VAProfileHEVCMain`/`VAProfileHEVCMain10` with `VAEntrypointEncSlice`.
+profile. Confirmed on the actual box: `vainfo` shows `VAProfileHEVCMain`/
+`VAProfileHEVCMain10` with `VAEntrypointEncSlice` via `libva2` 2.22.0 +
+`mesa-va-drivers` 25.0.7 (`radeonsi`), accessible headlessly through
+`/dev/dri/renderD128` (no X/Wayland session needed). Empirically discovered
+hardware constraint: the encoder rejects anything smaller than **130x128**
+(`avcodec_open2` fails EINVAL below that) and caps out at 8192x4352.
 
 ## Decode & render (client)
 
@@ -93,11 +97,28 @@ Single cross-platform window: `winit` + `wgpu`, one binary for both platforms.
 
 ## Status
 
-Milestone 1 (this pass): workspace scaffold with real trait boundaries for
-every subsystem; **transport + pairing is fully implemented and tested**
-end-to-end over loopback, since it's the one layer with no OS-specific
-dependency and is provable in a headless container. Capture/encode/input/
-render are stubbed behind their traits with a synthetic test-pattern source so
-the pipeline is wireable and inspectable, but real PipeWire/ScreenCaptureKit/
-VAAPI/VideoToolbox/libei/CGEvent backends need to be built and exercised on
-actual Linux desktop and macOS hardware — that's the next milestone.
+Milestone 1: workspace scaffold with real trait boundaries for every
+subsystem; **transport + pairing fully implemented and tested** end-to-end
+over loopback (the one layer with no OS-specific dependency, provable in a
+headless container).
+
+Milestone 2: **real hardware HEVC encode, Linux/AMD only, fully working and
+independently verified** — `dragonvnc-codec::vaapi::VaapiHevcEncoder` wraps
+libavcodec's `hevc_vaapi` (see "Encoding" above for why libavcodec rather
+than hand-rolled VAAPI parameter buffers). Verified two ways: a crate test
+encodes on the real RX 6700 XT and decodes the result with a *separate*
+software HEVC decoder (proving the bitstream is standards-valid, not just
+self-consistent), and a live server→QUIC→client run was dumped to a raw
+`.hevc` file and independently confirmed by `ffprobe`/`ffmpeg` (320x240,
+118 frames cleanly decoded from a real network capture). The demo client
+does not yet decode HEVC itself (see below).
+
+Still stubbed: capture (PipeWire/ScreenCaptureKit), input injection
+(libei/CGEvent), and client-side decode + `wgpu` render. Real client-side
+decode is deliberately not attempted yet: the target client platform is
+macOS/VideoToolbox, and this environment has no Mac to build or run that
+against — writing VideoToolbox FFI blind, with no way to verify it, isn't
+worth the risk of a confident-looking but untested implementation. The demo
+client stays on `PassthroughCodec` (works identically on any platform,
+already verified) plus a `--dump-raw` escape hatch for inspecting whatever
+the server actually sends with independent tooling, as done above.

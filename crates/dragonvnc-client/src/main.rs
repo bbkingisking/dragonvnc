@@ -5,12 +5,14 @@
 //! each frame and reports throughput, to prove the bytes arriving are
 //! correct and complete.
 
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 
 use clap::Parser;
 use dragonvnc_codec::Decoder;
 use dragonvnc_net::{endpoint, pairing::PairingCode};
-use dragonvnc_proto::{ControlMessage, FrameHeader, PROTOCOL_VERSION};
+use dragonvnc_proto::{ControlMessage, FrameHeader, VideoCodec, PROTOCOL_VERSION};
 
 #[derive(Parser)]
 struct Args {
@@ -21,6 +23,17 @@ struct Args {
     /// Pairing code shown by the server.
     #[arg(long)]
     code: String,
+
+    /// Write the raw video payloads to this file instead of decoding them.
+    /// There's no real decoder wired up client-side yet (see DESIGN.md —
+    /// the client's own decode is the next milestone, VideoToolbox on
+    /// macOS being the actual target platform, unverified without real
+    /// Mac hardware to build/run against); this is how the server's
+    /// hardware-encoded HEVC output gets verified for now — dump it and
+    /// check it with an independent decoder (e.g.
+    /// `ffprobe -f hevc dump.hevc`).
+    #[arg(long)]
+    dump_raw: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -63,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut video_recv = connection.accept_uni().await?;
     let mut decoder = dragonvnc_codec::PassthroughCodec;
+    let mut dump_file = args.dump_raw.map(std::fs::File::create).transpose()?;
     let mut frames_this_second = 0u32;
     let mut bytes_this_second = 0u64;
     let mut window_start = std::time::Instant::now();
@@ -74,7 +88,19 @@ async fn main() -> anyhow::Result<()> {
         };
         let mut payload = vec![0u8; header.payload_len as usize];
         video_recv.read_exact(&mut payload).await?;
-        let _rgba = decoder.decode(&payload, header.width, header.height)?;
+
+        match (header.codec, &mut dump_file) {
+            (_, Some(f)) => f.write_all(&payload)?,
+            (VideoCodec::TestPatternRgba, None) => {
+                let _rgba = decoder.decode(&payload, header.width, header.height)?;
+            }
+            (other, None) => {
+                anyhow::bail!(
+                    "no client-side decoder for {other:?} yet (see DESIGN.md) — pass \
+                     --dump-raw to inspect the stream instead"
+                );
+            }
+        }
 
         frames_this_second += 1;
         bytes_this_second += payload.len() as u64;

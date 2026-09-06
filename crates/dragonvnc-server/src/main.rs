@@ -1,18 +1,20 @@
 //! Demo/debug server binary. Proves the transport+pairing+control pipeline
-//! end-to-end using the synthetic `TestPatternSource` and `PassthroughCodec`
-//! from dragonvnc-capture/dragonvnc-codec — real capture and hardware
-//! encode are the next milestone (see DESIGN.md "Status"). Not the final
-//! UX: every connection currently re-runs the pairing ceremony rather than
-//! offering a pinned-reconnect path, even though dragonvnc-net already
-//! supports and tests that (see its `pinned_reconnect_*` tests). Wiring
-//! that choice into this CLI is small follow-up work.
+//! end-to-end using the synthetic `TestPatternSource` from dragonvnc-capture
+//! — real capture is still the next milestone (see DESIGN.md "Status").
+//! Encoding is real, not stubbed: `--codec vaapi-hevc` runs the actual VAAPI
+//! HEVC hardware encoder (Linux/AMD only for now); `--codec passthrough`
+//! (the default) sends raw RGBA for testing the rest of the pipeline
+//! independent of any encoder. Not the final UX: every connection currently
+//! re-runs the pairing ceremony rather than offering a pinned-reconnect
+//! path, even though dragonvnc-net already supports and tests that (see its
+//! `pinned_reconnect_*` tests). Wiring that choice into this CLI is small
+//! follow-up work.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
 use dragonvnc_capture::{FrameSource, TestPatternSource};
-use dragonvnc_codec::Encoder;
 use dragonvnc_net::{endpoint, pairing, ServerIdentity};
 use dragonvnc_proto::{ControlMessage, FrameHeader, PROTOCOL_VERSION};
 
@@ -34,6 +36,30 @@ struct Args {
     height: u32,
     #[arg(long, default_value_t = 30)]
     fps: u32,
+
+    /// Which encoder to feed captured frames through.
+    #[arg(long, value_enum, default_value_t = Codec::Passthrough)]
+    codec: Codec,
+
+    /// VAAPI render node to encode on (only used with --codec vaapi-hevc).
+    #[cfg(target_os = "linux")]
+    #[arg(long, default_value = dragonvnc_codec::vaapi::DEFAULT_DEVICE)]
+    vaapi_device: String,
+
+    /// Target bitrate in bits/sec (only used with --codec vaapi-hevc).
+    #[arg(long, default_value_t = 4_000_000)]
+    bitrate: i64,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Codec {
+    /// Raw RGBA, no compression. Works everywhere, useful for proving the
+    /// rest of the pipeline independent of any encoder.
+    Passthrough,
+    /// Hardware HEVC via VAAPI. Linux only — see DESIGN.md for why this is
+    /// currently the only real encoder backend (the reference server GPU,
+    /// an AMD RX 6700 XT, has no hardware AV1 encoder).
+    VaapiHevc,
 }
 
 fn default_identity_path() -> PathBuf {
@@ -73,13 +99,54 @@ async fn main() -> anyhow::Result<()> {
         let height = args.height;
         let fps = args.fps;
         let code = code.clone();
+        let codec = args.codec;
+        let bitrate = args.bitrate;
+        #[cfg(target_os = "linux")]
+        let vaapi_device = args.vaapi_device.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, width, height, fps, code).await {
+            let result = handle_connection(
+                incoming,
+                width,
+                height,
+                fps,
+                code,
+                codec,
+                bitrate,
+                #[cfg(target_os = "linux")]
+                vaapi_device,
+            )
+            .await;
+            if let Err(e) = result {
                 tracing::warn!(error = %e, "connection ended with error");
             }
         });
     }
     Ok(())
+}
+
+fn make_encoder(
+    codec: Codec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: i64,
+    #[cfg(target_os = "linux")] vaapi_device: &str,
+) -> anyhow::Result<Box<dyn dragonvnc_codec::Encoder>> {
+    match codec {
+        Codec::Passthrough => Ok(Box::new(dragonvnc_codec::PassthroughCodec)),
+        #[cfg(target_os = "linux")]
+        Codec::VaapiHevc => Ok(Box::new(dragonvnc_codec::vaapi::VaapiHevcEncoder::new(
+            vaapi_device,
+            width,
+            height,
+            fps,
+            bitrate,
+        )?)),
+        #[cfg(not(target_os = "linux"))]
+        Codec::VaapiHevc => anyhow::bail!(
+            "--codec vaapi-hevc is Linux-only (VAAPI); this build was compiled for a different target"
+        ),
+    }
 }
 
 async fn handle_connection(
@@ -88,6 +155,9 @@ async fn handle_connection(
     height: u32,
     fps: u32,
     code: pairing::PairingCode,
+    codec: Codec,
+    bitrate: i64,
+    #[cfg(target_os = "linux")] vaapi_device: String,
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
     tracing::info!(peer = %connection.remote_address(), "connection established");
@@ -132,27 +202,41 @@ async fn handle_connection(
     // realistically small) is next-milestone work — see DESIGN.md.
     let mut video_send = connection.open_uni().await?;
     let mut source = TestPatternSource::new(width, height, fps);
-    let mut encoder = dragonvnc_codec::PassthroughCodec;
+    let mut encoder = make_encoder(
+        codec,
+        width,
+        height,
+        fps,
+        bitrate,
+        #[cfg(target_os = "linux")]
+        &vaapi_device,
+    )?;
     let mut frame_id = 0u64;
-    while let Some(frame) = source.next_frame().await? {
-        let encoded = encoder.encode(&frame)?;
-        let header = FrameHeader {
-            display_id: 0,
-            frame_id,
-            timestamp_us: frame.info.timestamp_us,
-            codec: encoded.codec,
-            width: frame.info.width,
-            height: frame.info.height,
-            keyframe: encoded.keyframe,
-            payload_len: encoded.payload.len() as u32,
-        };
-        if send_video_frame(&mut video_send, &header, &encoded.payload)
-            .await
-            .is_err()
-        {
-            break; // client went away
+    // NOTE: encode() below runs synchronous, blocking FFI (CPU pixel
+    // conversion + a VAAPI submission) directly inside this async task.
+    // Fine for this milestone's frame rates; a real deployment should move
+    // this to `spawn_blocking` so a slow encode can't stall other tokio
+    // tasks on the same worker thread.
+    'outer: while let Some(frame) = source.next_frame().await? {
+        for encoded in encoder.encode(&frame)? {
+            let header = FrameHeader {
+                display_id: 0,
+                frame_id,
+                timestamp_us: frame.info.timestamp_us,
+                codec: encoded.codec,
+                width: frame.info.width,
+                height: frame.info.height,
+                keyframe: encoded.keyframe,
+                payload_len: encoded.payload.len() as u32,
+            };
+            if send_video_frame(&mut video_send, &header, &encoded.payload)
+                .await
+                .is_err()
+            {
+                break 'outer; // client went away
+            }
+            frame_id += 1;
         }
-        frame_id += 1;
     }
 
     Ok(())
