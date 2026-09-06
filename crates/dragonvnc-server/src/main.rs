@@ -1,12 +1,14 @@
-//! Demo/debug server binary. Proves the transport+pairing+control pipeline
-//! end-to-end using the synthetic `TestPatternSource` from dragonvnc-capture
-//! — real capture is still the next milestone (see DESIGN.md "Status").
-//! Encoding is real, not stubbed: `--codec vaapi-hevc` runs the actual VAAPI
-//! HEVC hardware encoder (Linux/AMD only for now); `--codec passthrough`
-//! (the default) sends raw RGBA for testing the rest of the pipeline
-//! independent of any encoder. Not the final UX: every connection currently
-//! re-runs the pairing ceremony rather than offering a pinned-reconnect
-//! path, even though dragonvnc-net already supports and tests that (see its
+//! Demo/debug server binary. Proves the full pipeline end-to-end.
+//! Capture is real, not stubbed: `--source pipewire` runs actual PipeWire
+//! screen capture via the XDG Desktop Portal ScreenCast interface (Linux
+//! only); `--source test-pattern` (the default) uses a synthetic moving
+//! gradient for testing the rest of the pipeline without needing a real
+//! display. Encoding is real too: `--codec vaapi-hevc` runs the actual
+//! VAAPI HEVC hardware encoder (Linux/AMD only for now); `--codec
+//! passthrough` (the default) sends raw pixels for testing independent of
+//! any encoder. Not the final UX: every connection currently re-runs the
+//! pairing ceremony rather than offering a pinned-reconnect path, even
+//! though dragonvnc-net already supports and tests that (see its
 //! `pinned_reconnect_*` tests). Wiring that choice into this CLI is small
 //! follow-up work.
 
@@ -28,12 +30,20 @@ struct Args {
     #[arg(long)]
     identity_path: Option<PathBuf>,
 
-    /// Test-pattern resolution/rate, since no real capture backend is
-    /// wired up yet.
+    /// Which capture backend to pull frames from.
+    #[arg(long, value_enum, default_value_t = Source::TestPattern)]
+    source: Source,
+
+    /// Test-pattern resolution/rate (only used with --source test-pattern;
+    /// real capture discovers its own resolution from the negotiated
+    /// stream format).
     #[arg(long, default_value_t = 320)]
     width: u32,
     #[arg(long, default_value_t = 240)]
     height: u32,
+    /// Encoder tuning hint (rate control timebase, GOP length). Actual
+    /// capture cadence (--source pipewire) isn't forced to match this yet —
+    /// see DESIGN.md.
     #[arg(long, default_value_t = 30)]
     fps: u32,
 
@@ -52,9 +62,20 @@ struct Args {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
+enum Source {
+    /// A moving gradient, useful for testing the rest of the pipeline
+    /// without a real display.
+    TestPattern,
+    /// Real screen capture via PipeWire/XDG portal. Linux only. May pop up
+    /// a compositor picker UI depending on the portal backend; fails if
+    /// there's nothing to capture (e.g. zero outputs attached).
+    Pipewire,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum Codec {
-    /// Raw RGBA, no compression. Works everywhere, useful for proving the
-    /// rest of the pipeline independent of any encoder.
+    /// Raw pixels, no compression. Works everywhere, useful for proving
+    /// the rest of the pipeline independent of any encoder.
     Passthrough,
     /// Hardware HEVC via VAAPI. Linux only — see DESIGN.md for why this is
     /// currently the only real encoder backend (the reference server GPU,
@@ -95,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         let Some(incoming) = ep.accept().await else {
             break;
         };
+        let source = args.source;
         let width = args.width;
         let height = args.height;
         let fps = args.fps;
@@ -106,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let result = handle_connection(
                 incoming,
+                source,
                 width,
                 height,
                 fps,
@@ -124,12 +147,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn make_source(
+    source: Source,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> anyhow::Result<Box<dyn FrameSource>> {
+    match source {
+        Source::TestPattern => Ok(Box::new(TestPatternSource::new(width, height, fps))),
+        #[cfg(target_os = "linux")]
+        Source::Pipewire => Ok(Box::new(dragonvnc_capture::pipewire::PipeWireSource::new().await?)),
+        #[cfg(not(target_os = "linux"))]
+        Source::Pipewire => anyhow::bail!(
+            "--source pipewire is Linux-only (PipeWire/XDG portal); this build was compiled for a different target"
+        ),
+    }
+}
+
 fn make_encoder(
     codec: Codec,
     width: u32,
     height: u32,
     fps: u32,
     bitrate: i64,
+    src_format: dragonvnc_capture::PixelFormat,
     #[cfg(target_os = "linux")] vaapi_device: &str,
 ) -> anyhow::Result<Box<dyn dragonvnc_codec::Encoder>> {
     match codec {
@@ -141,6 +182,7 @@ fn make_encoder(
             height,
             fps,
             bitrate,
+            src_format,
         )?)),
         #[cfg(not(target_os = "linux"))]
         Codec::VaapiHevc => anyhow::bail!(
@@ -149,8 +191,10 @@ fn make_encoder(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     incoming: quinn::Incoming,
+    source: Source,
     width: u32,
     height: u32,
     fps: u32,
@@ -181,6 +225,24 @@ async fn handle_connection(
         "protocol version mismatch: client={protocol_version} server={PROTOCOL_VERSION}"
     );
     tracing::info!(%client_name, "client said hello");
+
+    // Capture must actually start before we can tell the client the real
+    // resolution: real capture (--source pipewire) doesn't know its own
+    // dimensions until the portal/PipeWire negotiate a format, which can
+    // only happen after connecting — there's no static answer to hand back
+    // for the Welcome message the way `--width`/`--height` gave one before.
+    let mut source: Box<dyn FrameSource> = make_source(source, width, height, fps).await?;
+    let first_frame = source
+        .next_frame()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("capture source produced no frames"))?;
+    tracing::info!(
+        width = first_frame.info.width,
+        height = first_frame.info.height,
+        format = ?first_frame.info.format,
+        "capture started"
+    );
+
     send_msg(
         &mut ctrl_send,
         &ControlMessage::Welcome {
@@ -188,36 +250,45 @@ async fn handle_connection(
             server_name: "dragonvnc-server".into(),
             displays: vec![dragonvnc_proto::DisplayInfo {
                 id: 0,
-                width,
-                height,
+                width: first_frame.info.width,
+                height: first_frame.info.height,
                 refresh_hz: fps,
             }],
         },
     )
     .await?;
 
+    let mut encoder = make_encoder(
+        codec,
+        first_frame.info.width,
+        first_frame.info.height,
+        fps,
+        bitrate,
+        first_frame.info.format,
+        #[cfg(target_os = "linux")]
+        &vaapi_device,
+    )?;
+
     // Video stream: capture -> encode -> length-prefixed frames on a
     // dedicated reliable uni stream. Real transport tuning (chunked,
     // loss-tolerant unreliable datagrams once encoded frames are
     // realistically small) is next-milestone work — see DESIGN.md.
     let mut video_send = connection.open_uni().await?;
-    let mut source = TestPatternSource::new(width, height, fps);
-    let mut encoder = make_encoder(
-        codec,
-        width,
-        height,
-        fps,
-        bitrate,
-        #[cfg(target_os = "linux")]
-        &vaapi_device,
-    )?;
     let mut frame_id = 0u64;
+    let mut pending_frame = Some(first_frame);
     // NOTE: encode() below runs synchronous, blocking FFI (CPU pixel
     // conversion + a VAAPI submission) directly inside this async task.
     // Fine for this milestone's frame rates; a real deployment should move
     // this to `spawn_blocking` so a slow encode can't stall other tokio
     // tasks on the same worker thread.
-    'outer: while let Some(frame) = source.next_frame().await? {
+    'outer: loop {
+        let frame = match pending_frame.take() {
+            Some(f) => f,
+            None => match source.next_frame().await? {
+                Some(f) => f,
+                None => break,
+            },
+        };
         for encoded in encoder.encode(&frame)? {
             let header = FrameHeader {
                 display_id: 0,

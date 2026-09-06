@@ -16,7 +16,7 @@ use std::ptr;
 
 use ffmpeg_sys_next as ff;
 
-use dragonvnc_capture::RawFrame;
+use dragonvnc_capture::{PixelFormat, RawFrame};
 use dragonvnc_proto::VideoCodec;
 
 use crate::{EncodedFrame, Encoder};
@@ -25,6 +25,17 @@ use crate::{EncodedFrame, Encoder};
 /// via `lspci`/`vainfo`); a real deployment should enumerate
 /// `/dev/dri/renderD*` rather than hardcoding it.
 pub const DEFAULT_DEVICE: &str = "/dev/dri/renderD128";
+
+fn av_pixel_format(format: PixelFormat) -> ff::AVPixelFormat {
+    match format {
+        PixelFormat::Rgba => ff::AVPixelFormat::AV_PIX_FMT_RGBA,
+        PixelFormat::Bgra => ff::AVPixelFormat::AV_PIX_FMT_BGRA,
+        // FFmpeg's "0" suffix formats mean "byte present, contents ignored"
+        // — exactly SPA/our PixelFormat's "x" (Rgbx/Bgrx) convention.
+        PixelFormat::Rgbx => ff::AVPixelFormat::AV_PIX_FMT_RGB0,
+        PixelFormat::Bgrx => ff::AVPixelFormat::AV_PIX_FMT_BGR0,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaapiError {
@@ -90,6 +101,7 @@ pub struct VaapiHevcEncoder {
     packet: *mut ff::AVPacket,
     width: u32,
     height: u32,
+    src_format: PixelFormat,
     frame_index: i64,
 }
 
@@ -99,14 +111,18 @@ pub struct VaapiHevcEncoder {
 unsafe impl Send for VaapiHevcEncoder {}
 
 impl VaapiHevcEncoder {
+    /// `src_format` is fixed for the encoder's lifetime, same as
+    /// width/height — a capture source that changes pixel format needs a
+    /// new encoder instance, same as one that changes resolution.
     pub fn new(
         device_path: &str,
         width: u32,
         height: u32,
         fps: u32,
         bitrate_bps: i64,
+        src_format: PixelFormat,
     ) -> Result<Self, VaapiError> {
-        unsafe { Self::new_unsafe(device_path, width, height, fps, bitrate_bps) }
+        unsafe { Self::new_unsafe(device_path, width, height, fps, bitrate_bps, src_format) }
     }
 
     unsafe fn new_unsafe(
@@ -115,6 +131,7 @@ impl VaapiHevcEncoder {
         height: u32,
         fps: u32,
         bitrate_bps: i64,
+        src_format: PixelFormat,
     ) -> Result<Self, VaapiError> {
         let encoder_name = CString::new("hevc_vaapi").unwrap();
         let codec = ff::avcodec_find_encoder_by_name(encoder_name.as_ptr());
@@ -198,7 +215,7 @@ impl VaapiHevcEncoder {
         let sws_ctx = ff::sws_getContext(
             width as i32,
             height as i32,
-            ff::AVPixelFormat::AV_PIX_FMT_RGBA,
+            av_pixel_format(src_format),
             width as i32,
             height as i32,
             ff::AVPixelFormat::AV_PIX_FMT_NV12,
@@ -240,6 +257,7 @@ impl VaapiHevcEncoder {
             packet,
             width,
             height,
+            src_format,
             frame_index: 0,
         })
     }
@@ -299,10 +317,17 @@ impl Encoder for VaapiHevcEncoder {
             self.width,
             self.height
         );
+        anyhow::ensure!(
+            frame.info.format == self.src_format,
+            "frame pixel format is {:?}, encoder configured for {:?} (a format change needs a new encoder instance)",
+            frame.info.format,
+            self.src_format
+        );
 
         unsafe {
-            let src_data: [*const u8; 4] = [frame.rgba.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
-            let src_linesize: [i32; 4] = [(self.width * 4) as i32, 0, 0, 0];
+            let src_data: [*const u8; 4] =
+                [frame.pixels.as_ptr(), ptr::null(), ptr::null(), ptr::null()];
+            let src_linesize: [i32; 4] = [frame.info.stride as i32, 0, 0, 0];
             let dst_data: [*mut u8; 4] = [
                 (*self.sw_frame).data[0],
                 (*self.sw_frame).data[1],
@@ -391,7 +416,7 @@ mod tests {
         let frame_count = 30;
 
         let mut encoder =
-            VaapiHevcEncoder::new(DEFAULT_DEVICE, width, height, fps, 2_000_000).expect(
+            VaapiHevcEncoder::new(DEFAULT_DEVICE, width, height, fps, 2_000_000, PixelFormat::Rgba).expect(
                 "VAAPI HEVC encoder init failed — this test assumes the reference AMD GPU/driver \
                  stack from DESIGN.md; run `vainfo` to check VAProfileHEVCMain/EncSlice support",
             );

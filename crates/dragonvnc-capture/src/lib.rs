@@ -1,24 +1,50 @@
-//! Screen capture abstraction. Real backends (PipeWire/portal + DRM-KMS
-//! fallback on Linux, ScreenCaptureKit on macOS) are the next milestone —
-//! see DESIGN.md "Status". This crate defines the trait boundary everything
+//! Screen capture abstraction. Real backends: PipeWire/portal on Linux (this
+//! module's `pipewire` submodule); ScreenCaptureKit on macOS and a DRM/KMS
+//! fallback for headless Linux are still the next milestone — see
+//! DESIGN.md "Status". This crate defines the trait boundary everything
 //! else builds against, plus a synthetic source for exercising the rest of
 //! the pipeline without real display hardware.
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
+/// Packed 8-bit-per-channel pixel layouts a capture backend might hand back.
+/// Deliberately limited to single-plane 32bpp layouts with no chroma
+/// subsampling (no YUV, no 24bpp) — real compositors offer those too, but
+/// this set covers what PipeWire/portal capture commonly negotiates and
+/// keeps the encoder side (a single `sws_scale` conversion, no plane-count
+/// juggling) simple. Revisit if a backend needs something outside this set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Byte order R,G,B,A — real alpha.
+    Rgba,
+    /// Byte order B,G,R,A — real alpha.
+    Bgra,
+    /// Byte order R,G,B,x — 4th byte present but meaningless.
+    Rgbx,
+    /// Byte order B,G,R,x — 4th byte present but meaningless.
+    Bgrx,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FrameInfo {
     pub width: u32,
     pub height: u32,
     pub timestamp_us: u64,
+    pub format: PixelFormat,
+    /// Bytes per row. May be larger than `width * 4` — real capture buffers
+    /// are often row-aligned/padded; callers must respect this, not assume
+    /// tightly-packed rows.
+    pub stride: u32,
 }
 
-/// One captured frame, tightly-packed 8-bit RGBA, row-major, no padding.
+/// One captured frame, 8 bits per channel, row-major, `info.stride` bytes
+/// per row (see [`PixelFormat`] for why this isn't always tightly-packed
+/// RGBA).
 #[derive(Debug, Clone)]
 pub struct RawFrame {
     pub info: FrameInfo,
-    pub rgba: Bytes,
+    pub pixels: Bytes,
 }
 
 #[async_trait]
@@ -77,13 +103,18 @@ impl FrameSource for TestPatternSource {
                 width: self.width,
                 height: self.height,
                 timestamp_us: self.started.elapsed().as_micros() as u64,
+                format: PixelFormat::Rgba,
+                stride: self.width * 4,
             },
-            rgba: Bytes::from(rgba),
+            pixels: Bytes::from(rgba),
         };
         self.frame_id += 1;
         Ok(Some(frame))
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod pipewire;
 
 #[cfg(test)]
 mod tests {
@@ -93,7 +124,7 @@ mod tests {
     async fn test_pattern_produces_correctly_sized_frames() {
         let mut src = TestPatternSource::new(16, 8, 30);
         let frame = src.next_frame().await.unwrap().unwrap();
-        assert_eq!(frame.rgba.len(), 16 * 8 * 4);
+        assert_eq!(frame.pixels.len(), 16 * 8 * 4);
         assert_eq!(frame.info.width, 16);
         assert_eq!(frame.info.height, 8);
     }

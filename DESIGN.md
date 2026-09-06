@@ -113,12 +113,42 @@ self-consistent), and a live server→QUIC→client run was dumped to a raw
 118 frames cleanly decoded from a real network capture). The demo client
 does not yet decode HEVC itself (see below).
 
-Still stubbed: capture (PipeWire/ScreenCaptureKit), input injection
-(libei/CGEvent), and client-side decode + `wgpu` render. Real client-side
-decode is deliberately not attempted yet: the target client platform is
-macOS/VideoToolbox, and this environment has no Mac to build or run that
-against — writing VideoToolbox FFI blind, with no way to verify it, isn't
-worth the risk of a confident-looking but untested implementation. The demo
-client stays on `PassthroughCodec` (works identically on any platform,
-already verified) plus a `--dump-raw` escape hatch for inspecting whatever
-the server actually sends with independent tooling, as done above.
+Milestone 3: **real PipeWire screen capture wired up**, via the XDG Desktop
+Portal ScreenCast interface (`ashpd`) — `dragonvnc-capture::pipewire`,
+selected with `--source pipewire` on the server. `RawFrame` grew a
+`PixelFormat` (Rgba/Bgra/Rgbx/Bgrx) and a `stride`, since real capture
+buffers aren't always tightly-packed RGBA the way the test pattern is;
+`VaapiHevcEncoder` now takes the source format as a parameter and reads
+`stride` per frame instead of assuming both. Restricted to plain mapped
+(non-DMA-BUF) buffers for now — no format modifiers are offered during
+negotiation, which keeps the compositor from proposing DMA-BUF; importing
+DMA-BUF for a zero-copy GPU-to-GPU path is a follow-up optimization.
+
+Verification here is partial and it's important to be honest about why:
+this reference machine's live `sway` session currently has **zero physical
+outputs attached** (it's genuinely headless right now) — which is
+representative of the real target use case, but means there is nothing to
+actually capture pixels from. What *is* verified: the capture code builds
+cleanly against the real installed `libpipewire`/portal stack, and a
+throwaway probe ran the full D-Bus portal handshake
+(`create_session`→`select_sources`→`start`) against the live
+`xdg-desktop-portal-wlr` instance and got back a real, specific error —
+`Invalid session` — once the portal discovered there was nothing to
+capture, with no hang and no panic. That confirms the wiring is
+structurally correct end to end up to the point where a real frame would
+start flowing. Actually receiving a frame needs either a monitor attached
+to this box, or a disposable nested headless-output compositor + its own
+portal instance for testing — deliberately not attempted here, since a
+second `xdg-desktop-portal-wlr` on the same session D-Bus risks colliding
+with the live one backing the user's actual desktop.
+
+Still stubbed: input injection (libei/CGEvent), ScreenCaptureKit (macOS
+capture — moot anyway, since macOS is the client-only platform here), and
+client-side decode + `wgpu` render. Real client-side decode is deliberately
+not attempted yet: the target client platform is macOS/VideoToolbox, and
+this environment has no Mac to build or run that against — writing
+VideoToolbox FFI blind, with no way to verify it, isn't worth the risk of a
+confident-looking but untested implementation. The demo client stays on
+`PassthroughCodec` (works identically on any platform, already verified)
+plus a `--dump-raw` escape hatch for inspecting whatever the server
+actually sends with independent tooling, as done above.

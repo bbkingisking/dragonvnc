@@ -40,9 +40,15 @@ pub trait Decoder: Send {
     fn decode(&mut self, payload: &[u8], width: u32, height: u32) -> anyhow::Result<bytes::Bytes>;
 }
 
-/// No-op "codec": ships raw RGBA as-is. Useful for proving out the rest of
+/// No-op "codec": ships raw pixels as-is. Useful for proving out the rest of
 /// the pipeline (transport, pacing, rendering) independent of any hardware
 /// encoder, and as the fallback when no HW encoder is available at all.
+/// Only handles tightly-packed RGBA (stride == width * 4) — real capture
+/// backends can hand back padded rows or a different channel order (see
+/// `dragonvnc_capture::PixelFormat`/`FrameInfo::stride`), which this codec
+/// doesn't account for. That's fine for `TestPatternSource` (always
+/// tightly-packed RGBA) but real sources should go through a real encoder
+/// (e.g. `vaapi::VaapiHevcEncoder`, which does handle both) instead.
 pub struct PassthroughCodec;
 
 impl Encoder for PassthroughCodec {
@@ -51,10 +57,18 @@ impl Encoder for PassthroughCodec {
     }
 
     fn encode(&mut self, frame: &RawFrame) -> anyhow::Result<Vec<EncodedFrame>> {
+        anyhow::ensure!(
+            frame.info.format == dragonvnc_capture::PixelFormat::Rgba
+                && frame.info.stride == frame.info.width * 4,
+            "PassthroughCodec only supports tightly-packed RGBA, got {:?} with stride {} for width {}",
+            frame.info.format,
+            frame.info.stride,
+            frame.info.width
+        );
         Ok(vec![EncodedFrame {
             codec: VideoCodec::TestPatternRgba,
             keyframe: true, // every frame is independently decodable
-            payload: frame.rgba.clone(),
+            payload: frame.pixels.clone(),
         }])
     }
 }
@@ -77,14 +91,20 @@ impl Decoder for PassthroughCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dragonvnc_capture::FrameInfo;
+    use dragonvnc_capture::{FrameInfo, PixelFormat};
 
     #[test]
     fn passthrough_roundtrips() {
         let rgba = bytes::Bytes::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]);
         let frame = RawFrame {
-            info: FrameInfo { width: 1, height: 2, timestamp_us: 0 },
-            rgba: rgba.clone(),
+            info: FrameInfo {
+                width: 1,
+                height: 2,
+                timestamp_us: 0,
+                format: PixelFormat::Rgba,
+                stride: 4,
+            },
+            pixels: rgba.clone(),
         };
         let mut codec = PassthroughCodec;
         let encoded = codec.encode(&frame).unwrap();
