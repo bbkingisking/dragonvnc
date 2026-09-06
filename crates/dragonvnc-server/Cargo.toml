@@ -21,3 +21,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 dirs = "7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dragonvnc-session = { path = "../dragonvnc-session" }

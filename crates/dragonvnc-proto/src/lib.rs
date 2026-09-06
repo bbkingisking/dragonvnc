@@ -81,6 +81,20 @@ pub enum ControlMessage {
     Bye,
 }
 
+/// A client's on-screen viewport: physical pixels plus the display's scale
+/// factor (e.g. 2560x1600 @2.0 for a 1280x800-points Retina window). Sent in
+/// [`ControlMessage::Hello`] so the server can size its display to exactly
+/// match before the first frame, and in [`ControlMessage::RequestMode`] on
+/// every later resize. `scale` is informational for the server (it forwards
+/// it to the compositor so UI chrome renders at the right density) — the
+/// video stream itself is always `width`x`height` physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DisplayInfo {
     pub id: u32,

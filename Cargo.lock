@@ -900,7 +900,23 @@ dependencies = [
  "dragonvnc-input",
  "dragonvnc-net",
  "dragonvnc-proto",
+ "dragonvnc-session",
  "quinn",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dragonvnc-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dragonvnc-proto",
+ "rand 0.8.8",
+ "regex",
+ "serde",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",

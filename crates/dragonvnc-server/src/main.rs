@@ -23,6 +23,58 @@ use dragonvnc_net::{endpoint, pairing, ServerIdentity};
 use dragonvnc_proto::{ControlMessage, FrameHeader, PROTOCOL_VERSION};
 
 #[derive(Parser)]
+#[command(name = "dragonvnc-server")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run the server (long-running; this is the normal mode).
+    Run(Args),
+    /// Internal: reports this process's `WAYLAND_DISPLAY`/`SWAYSOCK` back to
+    /// the session launcher waiting on `$DRAGONVNC_HANDOFF`. Only makes
+    /// sense invoked via `exec` from inside a headless sway session this
+    /// same binary spawned (see `dragonvnc-session`'s generated overlay
+    /// config) — never run this by hand.
+    #[cfg(target_os = "linux")]
+    SessionReady,
+    /// Starts a headless sway session, resizes it, tears it down, and
+    /// checks nothing leaked — a way to verify `dragonvnc-session` without a
+    /// client. See PLAN-headless-session.md item 1.
+    #[cfg(target_os = "linux")]
+    ProbeSession(ProbeSessionArgs),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Parser)]
+struct ProbeSessionArgs {
+    /// Initial mode, `WIDTHxHEIGHT[@SCALE]` (scale defaults to 1.0).
+    #[arg(long, default_value = "1920x1080")]
+    mode: String,
+
+    /// The user's real sway config to build the headless overlay from.
+    #[arg(long, default_value_os_t = default_sway_config_path())]
+    sway_config: PathBuf,
+
+    /// The `sway-session` wrapper to launch through (must forward args to
+    /// `sway` — see `dragonvnc-session`'s module doc).
+    #[arg(long, default_value_os_t = default_sway_session_path())]
+    sway_session: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn default_sway_config_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".config/sway/config")
+}
+
+#[cfg(target_os = "linux")]
+fn default_sway_session_path() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir).join(".config/sway/sway-session")
+}
+
+#[derive(Parser)]
 struct Args {
     /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0:5900")]
@@ -103,8 +155,106 @@ fn default_screencast_token_path() -> PathBuf {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    let cli = Cli::parse();
 
+    match cli.command {
+        Command::Run(args) => run(args).await,
+        #[cfg(target_os = "linux")]
+        Command::SessionReady => {
+            dragonvnc_session::handoff::send_ready().await?;
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        Command::ProbeSession(args) => probe_session(args).await,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mode(s: &str) -> anyhow::Result<dragonvnc_proto::Viewport> {
+    let (dims, scale) = match s.split_once('@') {
+        Some((dims, scale)) => (dims, scale.parse()?),
+        None => (s, 1.0),
+    };
+    let (w, h) = dims
+        .split_once('x')
+        .ok_or_else(|| anyhow::anyhow!("expected WIDTHxHEIGHT[@SCALE], got {s:?}"))?;
+    Ok(dragonvnc_proto::Viewport { width: w.parse()?, height: h.parse()?, scale })
+}
+
+/// Verifies item 1 end to end with no client involved: start a session,
+/// confirm the handoff values, resize it live and check `get_outputs`
+/// reflects it, sleep, tear down, then assert nothing leaked. See
+/// PLAN-headless-session.md item 1's "Verify" section — run this twice in a
+/// row to catch stale-socket/stale-unit bugs.
+#[cfg(target_os = "linux")]
+async fn probe_session(args: ProbeSessionArgs) -> anyhow::Result<()> {
+    let viewport = parse_mode(&args.mode)?;
+    let server_bin = std::env::current_exe()?;
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dragonvnc");
+    let opts =
+        dragonvnc_session::SessionOptions::new(args.sway_config, args.sway_session, server_bin, runtime_dir.clone());
+
+    println!("starting session at {}x{}@{}...", viewport.width, viewport.height, viewport.scale);
+    let session = dragonvnc_session::SessionHandle::start(&opts, viewport).await?;
+    let unit_name = session.unit_name().to_string();
+    println!(
+        "session {} ready: WAYLAND_DISPLAY={} SWAYSOCK={}",
+        session.id(),
+        session.wayland_display(),
+        session.sway_socket().display()
+    );
+
+    println!("resizing to 2560x1440...");
+    session
+        .set_mode(dragonvnc_proto::Viewport { width: 2560, height: 1440, scale: 1.0 })
+        .await?;
+
+    let outputs = tokio::process::Command::new("swaymsg")
+        .arg("-s")
+        .arg(session.sway_socket())
+        .args(["-t", "get_outputs"])
+        .output()
+        .await?;
+    let outputs_json = String::from_utf8_lossy(&outputs.stdout);
+    anyhow::ensure!(
+        outputs.status.success() && outputs_json.contains("2560") && outputs_json.contains("1440"),
+        "get_outputs did not reflect the resize to 2560x1440: {outputs_json}"
+    );
+    println!("resize verified via get_outputs");
+
+    println!("sleeping 3s...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let wayland_display = session.wayland_display().to_string();
+    session.stop().await?;
+    println!("session stopped");
+
+    let leaked_units = tokio::process::Command::new("systemctl")
+        .args(["--user", "list-units", &format!("{unit_name}*"), "--all", "--no-legend"])
+        .output()
+        .await?;
+    let leaked_units_out = String::from_utf8_lossy(&leaked_units.stdout);
+    anyhow::ensure!(
+        leaked_units_out.trim().is_empty(),
+        "unit leaked after stop(): {leaked_units_out}"
+    );
+
+    // `runtime_dir` is `$XDG_RUNTIME_DIR/dragonvnc`; its parent is the real
+    // XDG runtime dir sway's socket lived in.
+    let xdg_runtime_dir = runtime_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("runtime dir {} has no parent", runtime_dir.display()))?;
+    let leaked_socket = xdg_runtime_dir.join(&wayland_display);
+    anyhow::ensure!(!leaked_socket.exists(), "wayland socket leaked after stop(): {}", leaked_socket.display());
+
+    println!("probe-session OK: no leaked units or sockets");
+    Ok(())
+}
+
+async fn run(args: Args) -> anyhow::Result<()> {
     let identity_path = args.identity_path.unwrap_or_else(default_identity_path);
     let identity = ServerIdentity::load_or_generate(&identity_path, "dragonvnc-server")?;
     tracing::info!(
