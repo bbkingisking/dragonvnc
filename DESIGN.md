@@ -238,9 +238,27 @@ would be for a macOS *server*, out of scope here), and `wgpu` render. The
 demo client now has a real decoder wired up for `VideoCodec::Hevc`
 (macOS) alongside `PassthroughCodec` for the test-pattern path, plus the
 `--dump-raw` escape hatch for inspecting the stream with independent
-tooling when needed. Not yet verified: decoding the server's *actual*
-network-transported HEVC output end-to-end across the real LAN (only
-decode-correctness-in-isolation and encode-correctness-in-isolation are
-proven so far, on their respective machines) — needs the Linux server
-actually running and reachable to close that loop, deliberately not done
-unilaterally this pass.
+tooling when needed.
+
+**Full cross-machine loop closed.** With the real Linux server running
+(`--source pipewire --codec vaapi-hevc`) and this Mac on the same LAN, the
+demo client connected live and decoded real network-transported HEVC for
+15 continuous seconds with no errors: pairing succeeded, the server
+reported its real 1920x1080 display, a real `VTDecompressionSession` was
+created, and frames decoded steadily (fps tracked how much the actual
+desktop was changing — 2 to 51 — consistent with PipeWire's damage-driven
+capture, not a bug). That's every real piece exercised together for the
+first time: live desktop → PipeWire capture → VAAPI HEVC hardware encode
+(RX 6700 XT) → QUIC over a real LAN → VideoToolbox HEVC hardware decode
+(M1), not each half verified only in isolation as before.
+
+Getting to that point surfaced a real, if mundane, lesson: what looked
+like a deep networking mystery (raw UDP silently dropped in one direction
+only, survived diagnosing Mullvad's LAN-sharing setting on both ends, a
+zombied LuLu system extension requiring a full reboot to clear) turned out
+to be a stale IP address for the Linux box the whole time — `ssh
+host.local` kept working throughout because mDNS resolved the *current*
+address, while the hardcoded IP used for the dragonvnc connection attempts
+was stale. The LuLu removal was a genuine, worthwhile fix in its own right
+(a system extension left silently enforcing after its app was deleted,
+only fully clearing on reboot), just not actually this session's blocker.
