@@ -1,0 +1,11 @@
+[package]
+name = "dragonvnc-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dragonvnc-proto = { path = "../dragonvnc-proto" }
+dragonvnc-capture = { path = "../dragonvnc-capture" }
+anyhow.workspace = true
+bytes.workspace = true

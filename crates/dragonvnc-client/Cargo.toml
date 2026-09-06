@@ -1,0 +1,20 @@
+[package]
+name = "dragonvnc-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dragonvnc-client"
+path = "src/main.rs"
+
+[dependencies]
+dragonvnc-net = { path = "../dragonvnc-net" }
+quinn = "0.11"
+dragonvnc-proto = { path = "../dragonvnc-proto" }
+dragonvnc-codec = { path = "../dragonvnc-codec" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4", features = ["derive"] }

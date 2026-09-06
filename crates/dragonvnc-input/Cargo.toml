@@ -1,0 +1,10 @@
+[package]
+name = "dragonvnc-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dragonvnc-proto = { path = "../dragonvnc-proto" }
+anyhow.workspace = true
+tracing.workspace = true
