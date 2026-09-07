@@ -1,15 +1,19 @@
 //! Building `quinn::Endpoint`s for the two situations this crate cares
 //! about: a server presenting its long-term identity, and a client either
 //! mid-pairing (accept-any verifier) or reconnecting to an already-pinned
-//! server (fingerprint-checked verifier).
+//! server (fingerprint-checked verifier). Mutual TLS both ways (item 5):
+//! the server always demands a client certificate too (`AcceptAnyClient`),
+//! and every client endpoint presents its own `ClientIdentity` — the actual
+//! "is this fingerprint allowed in" decision for either side happens above
+//! this module, after the handshake, against a trust store.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Once};
 
 use rustls::pki_types::PrivateKeyDer;
 
-use crate::identity::{Fingerprint, ServerIdentity};
-use crate::verifier::{AcceptAnyForPairing, PinnedVerifier};
+use crate::identity::{ClientIdentity, Fingerprint, ServerIdentity};
+use crate::verifier::{AcceptAnyClient, AcceptAnyForPairing, PinnedVerifier};
 
 pub const ALPN: &[u8] = b"dragonvnc/1";
 
@@ -44,7 +48,7 @@ pub fn server_endpoint(
     let key = PrivateKeyDer::Pkcs8(identity.key_der.clone_key());
 
     let mut rustls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(AcceptAnyClient))
         .with_single_cert(certs, key)?;
     rustls_config.alpn_protocols = vec![ALPN.to_vec()];
 
@@ -59,13 +63,17 @@ pub fn server_endpoint(
 fn client_endpoint_with_verifier(
     bind_addr: SocketAddr,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    identity: &ClientIdentity,
 ) -> anyhow::Result<quinn::Endpoint> {
     ensure_crypto_provider();
+
+    let certs = vec![identity.cert_der.clone()];
+    let key = PrivateKeyDer::Pkcs8(identity.key_der.clone_key());
 
     let mut rustls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(certs, key)?;
     rustls_config.alpn_protocols = vec![ALPN.to_vec()];
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)?;
@@ -77,17 +85,21 @@ fn client_endpoint_with_verifier(
     Ok(endpoint)
 }
 
-/// A client endpoint willing to talk to *any* server identity. Only ever
-/// used for the duration of a pairing ceremony — see `crate::pairing`.
-pub fn client_endpoint_for_pairing(bind_addr: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
-    client_endpoint_with_verifier(bind_addr, Arc::new(AcceptAnyForPairing))
+/// A client endpoint willing to talk to *any* server identity, presenting
+/// `identity` as its own. Only ever used for the duration of a pairing
+/// ceremony — see `crate::pairing`. The server sees this same `identity`'s
+/// fingerprint too (mutual TLS), and pins it on success.
+pub fn client_endpoint_for_pairing(bind_addr: SocketAddr, identity: &ClientIdentity) -> anyhow::Result<quinn::Endpoint> {
+    client_endpoint_with_verifier(bind_addr, Arc::new(AcceptAnyForPairing), identity)
 }
 
-/// A client endpoint that only accepts the given pinned server fingerprint.
-/// This is the normal, no-code-needed reconnection path.
+/// A client endpoint that only accepts the given pinned server fingerprint,
+/// presenting `identity` as its own. This is the normal, no-code-needed
+/// reconnection path.
 pub fn client_endpoint_pinned(
     bind_addr: SocketAddr,
     expected: Fingerprint,
+    identity: &ClientIdentity,
 ) -> anyhow::Result<quinn::Endpoint> {
-    client_endpoint_with_verifier(bind_addr, Arc::new(PinnedVerifier { expected }))
+    client_endpoint_with_verifier(bind_addr, Arc::new(PinnedVerifier { expected }), identity)
 }

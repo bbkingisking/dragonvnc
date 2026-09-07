@@ -1,6 +1,14 @@
 //! Server long-term identity: a self-signed Ed25519 certificate. There is no
 //! CA — trust comes from the pairing ceremony (`crate::pairing`) pinning this
 //! certificate's fingerprint on the client, not from anyone signing it.
+//!
+//! The same shape serves a client's long-term device identity ([`ClientIdentity`],
+//! a type alias — see PLAN-headless-session.md item 5): a paired *device* is
+//! the login, so the client needs a durable identity of its own, not just
+//! the server's. Symmetric to `ServerIdentity` in every way — self-signed,
+//! no CA, pinned by the peer on successful pairing (this time server-side,
+//! in a `PairedClients` store) — the two are only conceptually distinct by
+//! which role presents them.
 
 use std::path::Path;
 
@@ -15,6 +23,20 @@ pub fn fingerprint_of_der(cert: &CertificateDer<'_>) -> Fingerprint {
     let mut hasher = Sha256::new();
     hasher.update(cert.as_ref());
     hasher.finalize().into()
+}
+
+/// Extracts the peer's certificate fingerprint from an established
+/// connection — the same `peer_identity()` downcast `crate::pairing::run`
+/// uses, factored out so callers (both sides: a server checking a client's
+/// fingerprint against `PairedClients`, or vice versa) don't need to know
+/// the `rustls`/`quinn` plumbing themselves. `None` means the peer
+/// presented no certificate, which shouldn't happen once both ends
+/// mandate client auth (item 5) — treat it as an error, not a missing pin.
+pub fn peer_fingerprint(connection: &quinn::Connection) -> Option<Fingerprint> {
+    connection
+        .peer_identity()
+        .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .and_then(|certs| certs.first().map(fingerprint_of_der))
 }
 
 /// A server's long-term self-signed identity. Generate once and persist the
@@ -81,3 +103,7 @@ struct StoredIdentity {
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
 }
+
+/// A client device's long-term self-signed identity — see this module's
+/// doc for why it's the same shape as `ServerIdentity`.
+pub type ClientIdentity = ServerIdentity;

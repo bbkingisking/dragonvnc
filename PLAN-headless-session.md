@@ -351,9 +351,21 @@ from the Mac: first connect pairs, second connect shows no code prompt.
   the server mid-connection leaves its active session's scope running
   indefinitely, since nothing tells systemd to stop it once the parent
   process is just gone (a systemd scope's lifetime isn't tied to its
-  launcher's). `systemctl --user stop 'dragonvnc-session-*'` cleans up by
-  hand meanwhile; a real fix is a `SIGTERM`/`SIGINT` handler that stops the
-  active session before the process exits, deferred as follow-up.
+  launcher's). Fixed: `run()` installs a SIGTERM/SIGINT handler that stops
+  whatever session is active before the process exits (verified live). A
+  `SIGKILL` (or a real crash) still bypasses this — `systemctl --user stop
+  'dragonvnc-session-*'` is the manual recovery for that case.
+- Item 5's pairing/pinning decision is made independently by each side from
+  its own state (client: its `TrustStore` of servers; server: its
+  `PairedClients` set) — normally consistent, but found live: revoking a
+  client server-side while the *client* still has that server pinned
+  produces a real, if unfriendly, error ("spake2 exchange failed:
+  WrongLength") rather than a clean "please re-pair" message, because the
+  client skips opening a pairing stream (it thinks it's still trusted) while
+  the server waits for one. Recovery is manual: clear the client's local
+  trust store (`paired_servers`) so it re-attempts pairing. A friendlier
+  fix — the server signaling "not paired, please pair" instead of silently
+  expecting a pairing stream — is follow-up work, not required for v1.
 
 ## Future work (out of this milestone, planned for)
 

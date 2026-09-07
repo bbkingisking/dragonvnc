@@ -11,6 +11,13 @@
 //! encoder (Linux/AMD only for now); `--codec passthrough` (the default)
 //! sends raw pixels for testing independent of any encoder.
 //!
+//! Mutual TLS (item 5): every connection presents a client certificate, not
+//! just the server's. A known device (its fingerprint already in the
+//! `PairedClients` store) skips the pairing ceremony entirely; an unknown
+//! one must complete it (the printed pairing code) once, after which it's
+//! pinned — "the paired device is the login". `clients list`/`clients
+//! revoke <fingerprint>` manage that store.
+//!
 //! Two more subcommands exist for verifying pieces of this without a
 //! client: `session-ready` (internal — see its own doc) and `probe-session`
 //! (start/resize/verify/teardown a session standalone).
@@ -24,7 +31,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use dragonvnc_capture::{FrameSource, RawFrame, TestPatternSource};
 use dragonvnc_input::InputInjector;
-use dragonvnc_net::{endpoint, pairing, ServerIdentity};
+use dragonvnc_net::{endpoint, pairing, PairedClients, ServerIdentity};
 use dragonvnc_proto::{ControlMessage, FrameHeader, Viewport, CLOSE_CODE_BUSY, PROTOCOL_VERSION};
 
 #[derive(Parser)]
@@ -50,6 +57,27 @@ enum Command {
     /// client. See PLAN-headless-session.md item 1.
     #[cfg(target_os = "linux")]
     ProbeSession(ProbeSessionArgs),
+    /// Manage the paired-client-device store (item 5) — the devices allowed
+    /// to log in without re-pairing.
+    Clients(ClientsArgs),
+}
+
+#[derive(Parser)]
+struct ClientsArgs {
+    #[command(subcommand)]
+    action: ClientsAction,
+}
+
+#[derive(clap::Subcommand)]
+enum ClientsAction {
+    /// List every paired client's fingerprint.
+    List,
+    /// Un-pin a client fingerprint — it must complete the pairing ceremony
+    /// (with a valid code) again before it can connect.
+    Revoke {
+        /// Hex-encoded fingerprint, as printed by `clients list`.
+        fingerprint: String,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -193,6 +221,54 @@ fn default_identity_path() -> PathBuf {
         .join("server_identity.bin")
 }
 
+fn default_paired_clients_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dragonvnc")
+        .join("paired_clients")
+}
+
+fn parse_fingerprint_hex(s: &str) -> anyhow::Result<dragonvnc_net::Fingerprint> {
+    let bytes = (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            s.get(i..i + 2)
+                .and_then(|byte| u8::from_str_radix(byte, 16).ok())
+                .ok_or_else(|| anyhow::anyhow!("{s:?} is not a valid hex fingerprint"))
+        })
+        .collect::<anyhow::Result<Vec<u8>>>()?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("expected a 32-byte (64 hex char) fingerprint, got {} bytes", v.len()))
+}
+
+fn clients_command(action: ClientsAction) -> anyhow::Result<()> {
+    let path = default_paired_clients_path();
+    let mut store = PairedClients::load_from(&path)?;
+    match action {
+        ClientsAction::List => {
+            let mut any = false;
+            for fp in store.list() {
+                println!("{}", hex(fp));
+                any = true;
+            }
+            if !any {
+                println!("(no paired clients)");
+            }
+        }
+        ClientsAction::Revoke { fingerprint } => {
+            let fp = parse_fingerprint_hex(&fingerprint)?;
+            if store.revoke(&fp) {
+                store.save_to(&path)?;
+                println!("revoked {}", hex(&fp));
+            } else {
+                println!("{} was not paired", hex(&fp));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -207,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(target_os = "linux")]
         Command::ProbeSession(args) => probe_session(args).await,
+        Command::Clients(args) => clients_command(args.action),
     }
 }
 
@@ -490,11 +567,31 @@ async fn handle_connection(
     let connection = incoming.await?;
     tracing::info!(peer = %connection.remote_address(), "connection established");
 
-    // Pairing ceremony. See module doc: v1 demo always re-pairs (no
-    // server-side client trust store yet — see item 5).
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    pairing::run(&connection, &mut send, &mut recv, &code).await?;
-    tracing::info!("pairing succeeded");
+    // Mutual TLS (item 5) means every connection — paired or not —
+    // presents a client certificate; `AcceptAnyClient` on the server side
+    // only proved the client holds its private key, not who it is. That
+    // check happens here, against the paired-client-device store: known
+    // fingerprint ⇒ skip pairing entirely (the client independently makes
+    // the same decision from its own server-trust store, so it only opens
+    // a pairing stream when it needs to — see `dragonvnc-client`); unknown
+    // ⇒ run the real ceremony and pin it on success.
+    let peer_fingerprint = dragonvnc_net::identity::peer_fingerprint(&connection)
+        .ok_or_else(|| anyhow::anyhow!("client presented no certificate — client auth is mandatory"))?;
+    let paired_clients_path = default_paired_clients_path();
+    let mut paired_clients = PairedClients::load_from(&paired_clients_path)?;
+    if paired_clients.is_paired(&peer_fingerprint) {
+        tracing::info!(fingerprint = %hex(&peer_fingerprint), "known client, skipping pairing ceremony");
+    } else {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        pairing::run(&connection, &mut send, &mut recv, &code).await?;
+        paired_clients.pair(peer_fingerprint);
+        paired_clients.save_to(&paired_clients_path)?;
+        // Every pairing success lands in the journal at `info` — this is
+        // the audit trail for "a new device paired" (see item 5); the
+        // pairing code itself stays valid afterward (not single-use
+        // globally) so a second device can pair with the same code.
+        tracing::info!(fingerprint = %hex(&peer_fingerprint), "pairing succeeded, client fingerprint pinned");
+    }
 
     // Control stream: Hello/Welcome handshake.
     let (mut ctrl_send, mut ctrl_recv) = connection.accept_bi().await?;

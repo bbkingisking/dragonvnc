@@ -15,10 +15,26 @@ use tokio::sync::watch;
 use winit::event_loop::EventLoopProxy;
 
 use dragonvnc_codec::Decoder;
-use dragonvnc_net::{endpoint, pairing::PairingCode};
+use dragonvnc_net::{endpoint, pairing::PairingCode, ClientIdentity, TrustStore};
 use dragonvnc_proto::{ControlMessage, FrameHeader, InputEvent, PointerButton, VideoCodec, Viewport, PROTOCOL_VERSION};
 
 use crate::render::RenderEvent;
+
+fn default_client_identity_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("dragonvnc").join("client_identity.bin")
+}
+
+fn default_server_trust_store_path() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("dragonvnc").join("paired_servers")
+}
+
+/// Persisted across connections — same reasoning as
+/// `dragonvnc_net::ServerIdentity`: a fresh identity every launch would
+/// make every prior pairing's pin useless (this client's fingerprint is
+/// what the server's `PairedClients` store remembers).
+fn load_client_identity() -> anyhow::Result<ClientIdentity> {
+    ClientIdentity::load_or_generate(&default_client_identity_path(), "dragonvnc-client")
+}
 
 fn make_decoder(codec: VideoCodec) -> anyhow::Result<Box<dyn Decoder>> {
     match codec {
@@ -42,20 +58,42 @@ struct Handshake {
 
 async fn connect_and_handshake(addr: SocketAddr, code: PairingCode, viewport: Viewport) -> anyhow::Result<Handshake> {
     let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
-    let ep = endpoint::client_endpoint_for_pairing(bind_addr)?;
-    let connection = ep.connect(addr, "dragonvnc")?.await?;
+    let client_identity = load_client_identity()?;
+    let trust_store_path = default_server_trust_store_path();
+    let mut server_trust = TrustStore::load_from(&trust_store_path)?;
+    // Keyed by address for this CLI (see `TrustStore`'s doc: the key's
+    // meaning is the caller's choice) — good enough for "same box/LAN
+    // address, same pin"; a real client with a persistent server identity
+    // (hostname, mDNS name) would key on that instead.
+    let server_key = addr.to_string();
+    let pinned_fingerprint = server_trust.get(&server_key);
+
+    let connection = match pinned_fingerprint {
+        Some(expected) => {
+            let ep = endpoint::client_endpoint_pinned(bind_addr, expected, &client_identity)?;
+            ep.connect(addr, "dragonvnc")?.await?
+        }
+        None => {
+            let ep = endpoint::client_endpoint_for_pairing(bind_addr, &client_identity)?;
+            ep.connect(addr, "dragonvnc")?.await?
+        }
+    };
     tracing::info!(peer = %connection.remote_address(), "connected");
 
-    let (mut send, mut recv) = connection.open_bi().await?;
-    let server_fingerprint = dragonvnc_net::pairing::run(&connection, &mut send, &mut recv, &code)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("server presented no certificate — pairing cannot be trusted"))?;
-    tracing::info!(
-        fingerprint = %hex(&server_fingerprint),
-        "pairing succeeded — in the real client this gets pinned to disk \
-         so future connections skip the code (see dragonvnc-net::TrustStore, \
-         already implemented and tested; not yet wired into this CLI)"
-    );
+    if pinned_fingerprint.is_none() {
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let server_fingerprint = dragonvnc_net::pairing::run(&connection, &mut send, &mut recv, &code)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("server presented no certificate — pairing cannot be trusted"))?;
+        server_trust.pin(server_key, server_fingerprint);
+        server_trust.save_to(&trust_store_path)?;
+        tracing::info!(
+            fingerprint = %hex(&server_fingerprint),
+            "pairing succeeded, server pinned — future connections to this address skip the code"
+        );
+    } else {
+        tracing::info!("server already pinned, skipping pairing ceremony");
+    }
 
     let (mut ctrl_send, mut ctrl_recv) = connection.open_bi().await?;
     send_msg(

@@ -23,7 +23,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 
-use crate::identity::{fingerprint_of_der, Fingerprint};
+use crate::identity::Fingerprint;
 
 const PAIRING_CONTEXT: &[u8] = b"dragonvnc-pairing-v1";
 const EXPORTER_LABEL: &[u8] = b"dragonvnc-pairing-exporter-v1";
@@ -129,12 +129,7 @@ pub async fn run(
         return Err(PairingError::ConfirmationMismatch);
     }
 
-    let fingerprint = connection
-        .peer_identity()
-        .and_then(|id| id.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
-        .and_then(|certs| certs.first().map(fingerprint_of_der));
-
-    Ok(fingerprint)
+    Ok(crate::identity::peer_fingerprint(connection))
 }
 
 fn confirm_value(shared_key: &[u8], exporter: &[u8; EXPORTER_LEN]) -> [u8; CONFIRM_LEN] {

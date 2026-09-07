@@ -734,6 +734,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "dirs",
  "dragonvnc-capture",
  "dragonvnc-codec",
  "dragonvnc-net",
