@@ -714,6 +714,12 @@ async fn handle_connection(
             #[cfg(target_os = "linux")]
             &args.vaapi_device,
         )?;
+        // Tracked alongside `encoder` because `Encoder` doesn't expose the
+        // size it was built for — see the frame-processing branch below on
+        // why this needs to be checked against every frame, not just kept
+        // in sync from `RequestMode` handling.
+        #[cfg(target_os = "linux")]
+        let mut encoder_dims = (first_frame.info.width, first_frame.info.height);
 
         // Resize requests flow input_task -> here: input_task owns `injector`
         // (so it can update pointer extents immediately) and is the one reading
@@ -843,6 +849,10 @@ async fn handle_connection(
                     ) {
                         Ok(new_encoder) => {
                             encoder = new_encoder;
+                            #[cfg(target_os = "linux")]
+                            {
+                                encoder_dims = (new_viewport.width, new_viewport.height);
+                            }
                             tracing::info!(?new_viewport, "resized: encoder rebuilt");
                         }
                         Err(e) => tracing::warn!(error = %e, "failed to rebuild encoder after resize, keeping the old one"),
@@ -859,6 +869,37 @@ async fn handle_connection(
                     #[cfg(target_os = "linux")]
                     {
                         src_format = frame.info.format;
+                    }
+
+                    // The encoder can lag or lead the compositor's actual
+                    // current size: `RequestMode` and the capture thread's
+                    // own in-flight requests are uncoordinated, so a frame
+                    // captured just before (or after) a resize can arrive
+                    // after (or before) the encoder rebuild that resize
+                    // triggered. Found live (2026-09-07): rapid resizing
+                    // hit this racily and killed the whole connection with
+                    // a dimension-mismatch error. Rather than keep chasing
+                    // ordering guarantees between two independent
+                    // pipelines, just rebuild whenever what we're about to
+                    // encode doesn't match what the encoder's built for —
+                    // the frame is ground truth, not our resize bookkeeping.
+                    #[cfg(target_os = "linux")]
+                    if (frame.info.width, frame.info.height) != encoder_dims {
+                        tracing::info!(
+                            old = ?encoder_dims,
+                            new = ?(frame.info.width, frame.info.height),
+                            "frame size doesn't match encoder, rebuilding"
+                        );
+                        encoder = make_encoder(
+                            args.codec,
+                            frame.info.width,
+                            frame.info.height,
+                            args.fps,
+                            args.bitrate,
+                            frame.info.format,
+                            &args.vaapi_device,
+                        )?;
+                        encoder_dims = (frame.info.width, frame.info.height);
                     }
 
                     let encode_started = Instant::now();
