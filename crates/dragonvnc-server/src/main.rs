@@ -1189,21 +1189,23 @@ mod live_input_tests {
         None
     }
 
-    /// Reproduces a real bug found live (2026-09-07, testing item 7 against
-    /// a real macOS client): ghostty is a single-instance GTK `GApplication`
-    /// — launching it a second time doesn't start a new process, it asks
-    /// whichever instance is *already running* (over the D-Bus session
-    /// bus, which this headless session shares with the physical one — a
-    /// sharing this plan's "Known limitations" already called out, just not
-    /// through this specific service) to open a new window. That instance
-    /// is still connected to whatever Wayland display it originally
-    /// started on, so the new window lands there — not in the headless
-    /// session `$mod+Return` was pressed in — and typing into the (window-
-    /// less) headless session goes nowhere. Skips itself if there's no
-    /// other live sway to test against (e.g. running outside this box).
+    /// Regression test for a real bug found live (2026-09-07, testing item
+    /// 7 against a real macOS client): ghostty is a single-instance GTK
+    /// `GApplication` — launching it a second time doesn't start a new
+    /// process, it asks whichever instance is *already running* (over the
+    /// D-Bus session bus) to open a new window. Before `dbus-run-session`
+    /// (see `dragonvnc_session::SessionHandle::start`'s doc), the headless
+    /// session shared the physical session's bus, so that already-running
+    /// instance was still connected to the *physical* Wayland display —
+    /// the new window opened there, not in the headless session
+    /// `$mod+Return` was pressed in, and typing into the (windowless)
+    /// headless session went nowhere. Now each session gets its own
+    /// private bus, so this must reproduce independently regardless of
+    /// what's already running elsewhere. Skips itself if there's no other
+    /// live sway to test against (e.g. running outside this box).
     #[tokio::test]
     #[ignore]
-    async fn ghostty_already_running_on_another_sway_opens_its_window_there_not_here() {
+    async fn ghostty_opens_in_the_headless_session_even_with_another_instance_running_elsewhere() {
         let session = start_probe_session(1280, 720).await;
         let Some(other_sock) = other_live_sway_socket(session.sway_socket()).await else {
             eprintln!("no other live sway instance on this box — skipping (nothing to reproduce against)");
@@ -1242,11 +1244,10 @@ mod live_input_tests {
         session.stop().await.unwrap();
 
         assert!(
-            !headless_has_ghostty,
-            "expected the bug to reproduce (no new ghostty window in the headless session) — \
-             it didn't: a ghostty window showed up in the headless tree even with another \
-             instance already running elsewhere. Either the bug is fixed, or something about \
-             this reproduction no longer holds — check both before assuming success."
+            headless_has_ghostty,
+            "expected a new ghostty window in the headless session (private D-Bus bus should \
+             keep single-instance activation from reaching the other compositor's already-\
+             running instance) — got none: {headless_tree}"
         );
     }
 

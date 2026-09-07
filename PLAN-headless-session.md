@@ -339,15 +339,33 @@ clean session teardown after disconnect).
 
 ## Known limitations of this design (accepted, to record in DESIGN.md)
 
-- The headless session shares the user's D-Bus, `systemd --user`, PipeWire,
-  gnome-keyring, and portal instances with the physical session. Apps in the
-  remote session that go through `xdg-desktop-portal` (file choosers in
-  sandboxed apps, screen sharing) will talk to the portal bound to the
-  *physical* `wayland-1`. Do **not** run `dbus-update-activation-environment
-  --systemd WAYLAND_DISPLAY` from the headless session; it would repoint the
-  physical session's activated services at the remote display.
+- **Fixed, not just accepted**: the headless session originally shared the
+  user's D-Bus *session bus* with the physical session (both landed on the
+  same `unix:path=/run/user/1000/bus`). Found live (2026-09-07, testing item
+  7 against a real macOS client) to be an actual bug, not a theoretical one:
+  ghostty (a single-instance GTK `GApplication`) launched via `$mod+Return`
+  in the headless session asked the already-running *physical*-session
+  instance (over that shared bus) to open a window, so it opened there
+  instead — and typing into the (windowless) headless session went nowhere.
+  This also explains the `mako`/fcitx5 "already running" D-Bus name
+  conflicts visible in every session's log before this. Fixed by wrapping
+  the spawned session in `dbus-run-session` (see
+  `dragonvnc_session::SessionHandle::start`'s doc) — each headless session
+  now gets its own private bus. Regression test:
+  `ghostty_opens_in_the_headless_session_even_with_another_instance_running_elsewhere`.
+  **Still shared** (a private session bus doesn't touch these): `systemd
+  --user` itself, PipeWire, gnome-keyring. Apps in the remote session that
+  go through `xdg-desktop-portal` may now activate a *fresh* portal instance
+  on their own private bus (untested) rather than definitely reaching the
+  physical one as before — behavior here is genuinely unverified either way,
+  not a settled fact; treat portal-dependent apps (file choosers in
+  sandboxed apps, screen sharing) as unreliable in the remote session until
+  someone checks. Do **not** run `dbus-update-activation-environment --systemd
+  WAYLAND_DISPLAY` from the headless session regardless; it would still
+  repoint the physical session's *own* activated services at the remote
+  display if it ever reached the shared bus.
 - Audio from the remote session plays on the box's real speakers (shared
-  PipeWire). Remote audio is future work.
+  PipeWire, unaffected by the D-Bus fix above). Remote audio is future work.
 - No Xwayland (not installed on this box). Wayland-native apps only.
 - `swayidle` is filtered out of the remote session; there is no idle lock,
   by design, because the session dies with the connection and the pinned

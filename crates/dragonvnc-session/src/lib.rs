@@ -13,13 +13,16 @@
 //! ## Lifecycle
 //!
 //! [`SessionHandle::start`] writes a generated sway config overlay, spawns
-//! `systemd-run --user --scope --collect --unit=dragonvnc-session-<id> -- sway-session
-//! -c <overlay>` as a child process, and waits on a one-shot Unix-socket
-//! handoff (see [`handoff`]) for the `WAYLAND_DISPLAY`/`SWAYSOCK` values sway
-//! picked for itself — these are never visible in `/proc/<pid>/environ`
-//! because sway only exports them into the environment of processes it
-//! `exec`s afterward, so the overlay config's own `exec dragonvnc-server
-//! session-ready` line is what reports them back.
+//! `systemd-run --user --scope --collect --unit=dragonvnc-session-<id> --
+//! dbus-run-session -- sway-session -c <overlay>` as a child process, and
+//! waits on a one-shot Unix-socket handoff (see [`handoff`]) for the
+//! `WAYLAND_DISPLAY`/`SWAYSOCK` values sway picked for itself — these are
+//! never visible in `/proc/<pid>/environ` because sway only exports them
+//! into the environment of processes it `exec`s afterward, so the overlay
+//! config's own `exec dragonvnc-server session-ready` line is what reports
+//! them back. `dbus-run-session` gives the session its own private D-Bus
+//! session bus, not the physical session's shared one — see `start`'s doc
+//! on why that turned out to matter.
 //!
 //! Teardown is **not** automatic on drop: callers must call
 //! [`SessionHandle::stop`] on every exit path (see its doc). `Drop` is only a
@@ -141,12 +144,12 @@ pub struct SessionHandle {
     sway_socket: PathBuf,
     conf_path: PathBuf,
     handoff_sock_path: PathBuf,
-    /// The `systemd-run --scope` child process. Confirmed live on the
-    /// reference box (see PLAN-headless-session.md): without `--no-block`,
-    /// `systemd-run --scope` execs the target command *as itself* — this
-    /// child's PID is sway's PID, and killing the scope's cgroup delivers
-    /// SIGTERM straight to this same process, so `child.wait()` really does
-    /// observe the session ending.
+    /// The `systemd-run --scope` child process — actually `dbus-run-session`
+    /// (see `start`'s doc on why), which outlives sway only long enough to
+    /// tear down the private D-Bus daemon after sway exits, so `child.wait()`
+    /// still correctly tracks "is the session over" even though this PID
+    /// isn't sway's own anymore. Killing the scope's cgroup (`stop_unit`)
+    /// takes out sway and this wrapper together regardless.
     child: Child,
     stopped: bool,
 }
@@ -199,7 +202,26 @@ impl SessionHandle {
         ] {
             cmd.arg(format!("--setenv={k}={v}"));
         }
-        cmd.arg("--").arg(&opts.sway_session_path).arg("-c").arg(&conf_path);
+        // `dbus-run-session` gives this session its own private D-Bus
+        // session bus instead of the physical session's shared one — found
+        // necessary live (2026-09-07, see PLAN-headless-session.md): a
+        // single-instance GTK app (e.g. ghostty) launched in the headless
+        // session was actually asking an already-running instance on the
+        // *physical* session (over the shared bus) to open a window there
+        // instead, since GApplication activation goes through whichever
+        // bus DBUS_SESSION_BUS_ADDRESS points at — not through
+        // WAYLAND_DISPLAY at all. A private bus also incidentally fixes the
+        // mako/fcitx5 "already running" D-Bus name conflicts visible in
+        // every session's log before this. `dbus-run-session` forks (it
+        // can't `exec` into its subprocess — it needs to survive to tear
+        // the private bus down after), so `child` below is
+        // `dbus-run-session`'s own PID, not sway's; see its doc.
+        cmd.arg("--")
+            .arg("dbus-run-session")
+            .arg("--")
+            .arg(&opts.sway_session_path)
+            .arg("-c")
+            .arg(&conf_path);
         cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::null());
         let mut child = cmd.spawn()?;
@@ -224,9 +246,10 @@ impl SessionHandle {
             Ok(h) => h,
             Err(e) => {
                 // Must go through `systemctl stop`, not `child.start_kill()`:
-                // `child` only tracks sway's own PID, but the scope's cgroup
-                // also holds waybar/fcitx5/mako/etc. sway `exec`'d — killing
-                // just sway leaves those running and the scope stuck
+                // `child` only tracks the tracked process's own PID (see its
+                // doc), but the scope's cgroup also holds waybar/fcitx5/
+                // mako/etc. sway `exec`'d — killing just the one process
+                // leaves those running and the scope stuck
                 // "active" indefinitely (found the hard way: see git log for
                 // this fix — every failed `start()` was leaking a full
                 // desktop's worth of processes that then fought later
