@@ -246,6 +246,14 @@ pub async fn run_windowed(
 
         let mut video_recv = connection.accept_uni().await?;
         let mut decoder: Option<Box<dyn Decoder>> = None;
+        // Tracked alongside `decoder` because `Decoder` doesn't expose the
+        // size it was built for — a resize rebuilds the *server's* encoder
+        // at the new size (see dragonvnc-server's RequestMode handling),
+        // and every real hardware decoder (VideoToolbox included) needs a
+        // fresh instance to match, same as the encoder side does. Found
+        // live (2026-09-07): without this, a real window resize just
+        // errored out of the whole decode loop and dropped the connection.
+        let mut decoder_dims: Option<(u32, u32)> = None;
         let session_started = Instant::now();
         let mut stats_window_started = Instant::now();
         let mut frames_this_window = 0u32;
@@ -277,19 +285,28 @@ pub async fn run_windowed(
             };
             let mut payload = vec![0u8; header.payload_len as usize];
             video_recv.read_exact(&mut payload).await?;
-            let is_first_decode = decoder.is_none();
-            if decoder.is_none() {
+            let needs_new_decoder = decoder_dims != Some((header.width, header.height));
+            if needs_new_decoder {
+                if decoder.is_some() {
+                    tracing::info!(
+                        old = ?decoder_dims,
+                        new = ?(header.width, header.height),
+                        "frame size changed, rebuilding decoder"
+                    );
+                }
                 decoder = Some(make_decoder(header.codec)?);
+                decoder_dims = Some((header.width, header.height));
             }
             let decode_started = Instant::now();
             let frame = decoder.as_mut().unwrap().decode(&payload, header.width, header.height)?;
             let decode_elapsed = decode_started.elapsed();
-            // The first decode call on a fresh decoder instance routinely
-            // includes one-time session setup (measured live: VideoToolbox
-            // takes ~100ms just to stand up its decompression session) —
-            // not a stall, so it's excluded from the warning to avoid
-            // crying wolf on every single connection.
-            if decode_elapsed > Duration::from_millis(100) && !is_first_decode {
+            // The first decode call on a fresh decoder instance (including
+            // right after a resize rebuild, not just the very first one)
+            // routinely includes one-time session setup (measured live:
+            // VideoToolbox takes ~100ms just to stand up its decompression
+            // session) — not a stall, so it's excluded from the warning to
+            // avoid crying wolf on every new connection or resize.
+            if decode_elapsed > Duration::from_millis(100) && !needs_new_decoder {
                 tracing::warn!(?decode_elapsed, width = header.width, height = header.height, "decode took unusually long");
             }
 
