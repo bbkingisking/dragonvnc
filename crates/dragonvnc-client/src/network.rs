@@ -268,16 +268,20 @@ pub async fn run_windowed(
                     // indistinguishable from "the window just froze": video
                     // stops updating, nothing logged, nothing shown. Now it
                     // at least ends up in the log, and (via the early
-                    // return below) in the window's title.
+                    // return below) in the window's title. `{e:#}` (not
+                    // `%e`) so the actual reason isn't buried one level down
+                    // in the source chain — see the outer error handler's
+                    // doc for why that distinction mattered live.
+                    let full_error = format!("{e:#}");
                     tracing::info!(
-                        error = %e,
+                        error = %full_error,
                         total_frames,
                         total_bytes,
                         alive = ?session_started.elapsed(),
                         "video stream ended"
                     );
                     let _ = proxy.send_event(RenderEvent::NetworkError(format!(
-                        "video stream ended: {e}"
+                        "video stream ended: {full_error}"
                     )));
                     input_task.abort();
                     return Ok(());
@@ -348,8 +352,17 @@ pub async fn run_windowed(
     .await;
 
     if let Err(e) = result {
-        tracing::error!(error = %e, "run_windowed ended with an error");
-        let _ = proxy.send_event(RenderEvent::NetworkError(e.to_string()));
+        // `%e`/`e.to_string()` only print anyhow's top-level message — for
+        // an error like a QUIC connection failure, that's just "connection
+        // lost", with the actually-useful reason (e.g. "closed by peer:
+        // busy: another client is connected") buried one level down in the
+        // source chain. `{:#}` (anyhow's alternate Display) walks the whole
+        // chain on one line — found missing live (2026-09-07) when a busy
+        // refusal showed up in the log as a bare "connection lost", giving
+        // no hint why.
+        let full_error = format!("{e:#}");
+        tracing::error!(error = %full_error, "run_windowed ended with an error");
+        let _ = proxy.send_event(RenderEvent::NetworkError(full_error));
     }
 }
 
