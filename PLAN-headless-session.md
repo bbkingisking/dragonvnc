@@ -308,16 +308,43 @@ explicit go-ahead) so the new unit could bind it. A real client connected
 through the deployed service end to end (pairing, ~6 Mbps HEVC stream,
 clean session teardown after disconnect).
 
-### 7. Client (macOS) — minimal, done last
+### 7. Client (macOS) — minimal, done last — verified live 2026-09-07
 
 - Send `viewport` in Hello from the window's physical size and
   `scale_factor()`; send `RequestMode` on `WindowEvent::Resized` /
-  `ScaleFactorChanged` (debounced).
+  `ScaleFactorChanged` (debounced). Done, and — after two bugs found and
+  fixed by actually resizing a real window (below) — confirmed smooth under
+  a rapid, erratic drag-resize: dozens of resize events in under a minute,
+  steady ~30fps throughout, zero lost packets, no disconnect.
 - Persist a `ClientIdentity`; use it for every connection; skip the code
-  prompt when the server doesn't open a pairing stream.
+  prompt when the server doesn't open a pairing stream. Done and verified
+  live: paired once, every later reconnect (including with a deliberately
+  wrong code) skipped pairing correctly.
 - Show the close reason ("busy") in the title bar — the `NetworkError` →
   title path from the diagnostics pass already does this.
 - Keep the `--move-to` scripted path; it is the verification tool for item 3.
+
+**Two real bugs found only by a real person resizing a real window** (no
+amount of scripted/synthetic testing had exercised this before):
+neither side had ever handled "the frame I'm about to en/decode is a
+different size than the en/decoder was built for" as anything but a hard
+error, and a live resize hits that from both directions:
+- Client: `run_windowed`'s decode loop only ever checked
+  `decoder.is_none()`, never rebuilt one after the first frame — the very
+  first resize disconnected outright (`VideoToolboxDecoder` correctly
+  refuses a size mismatch by design). Fixed by tracking the decoder's
+  built-for dimensions and rebuilding whenever the incoming frame's size
+  differs.
+- Server: rebuilding the encoder only on `RequestMode` isn't enough — the
+  capture thread's own continuously-in-flight requests and the
+  `RequestMode`-triggered rebuild are uncoordinated, so under a fast burst
+  of resizes a frame captured just before/after a `session.set_mode()` can
+  reach the video loop after/before the matching encoder rebuild,
+  especially once a slow network send is monopolizing the same `select!`
+  loop's attention. Fixed the same way: rebuild whenever the frame about to
+  be encoded doesn't match the encoder's current size, not just when
+  `RequestMode` says to — the frame is ground truth, not the resize
+  bookkeeping.
 
 ## End-to-end verification, in order
 
@@ -327,15 +354,21 @@ clean session teardown after disconnect).
 3. Capture parity against `grim` on the probe session.
 4. Scripted input into a terminal in the probe session.
 5. Server under `systemd --user`, `journalctl` shows the code.
-6. Mac client: pair, see the headless desktop with waybar/wallpaper at Retina
-   size, type into a terminal, resize the window and watch the desktop
-   re-layout, close the client and confirm the scope and all its processes
-   are gone within 5 s. Reconnect without a code.
+6. **Done, verified live (2026-09-07)**: Mac client paired, saw the headless
+   desktop with waybar at Retina size, typed into a real ghostty terminal
+   (after fixing the D-Bus single-instance cross-talk bug — see limitations
+   below), resized the window repeatedly and watched the desktop re-layout
+   smoothly (after fixing the two decoder/encoder rebuild bugs above),
+   reconnected without a code.
 7. Negative: second Mac connection (or a loopback client) while connected is
-   refused with "busy"; a client with a fresh identity and no code is refused.
+   refused with "busy" — verified via `--dump-raw` (item 4's own live
+   testing); a client with a fresh identity and no code is refused — not
+   yet independently re-verified from the real Mac client specifically.
 8. The physical seat0 session is untouched throughout (no new input devices,
    no keystrokes landing on it — this is the regression the uinput change
-   guards against).
+   guards against). Confirmed indirectly: the D-Bus cross-talk bug (below)
+   was the one way a remote action *did* land on the physical session, and
+   it's now fixed.
 
 ## Known limitations of this design (accepted, to record in DESIGN.md)
 
