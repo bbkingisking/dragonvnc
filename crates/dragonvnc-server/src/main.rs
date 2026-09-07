@@ -21,6 +21,13 @@
 //! Two more subcommands exist for verifying pieces of this without a
 //! client: `session-ready` (internal — see its own doc) and `probe-session`
 //! (start/resize/verify/teardown a session standalone).
+//!
+//! Every flag below also reads from a `DRAGONVNC_<NAME>` environment
+//! variable (e.g. `--bind` / `DRAGONVNC_BIND`, `--codec` / `DRAGONVNC_CODEC`
+//! — see each flag's `env` attribute for its exact name), an explicit flag
+//! still wins over the environment. That's what a `systemd --user` unit's
+//! `Environment=`/`EnvironmentFile=` should set rather than a long
+//! `ExecStart=` argument list — see PLAN-headless-session.md item 6.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -66,6 +73,10 @@ enum Command {
 struct ClientsArgs {
     #[command(subcommand)]
     action: ClientsAction,
+
+    /// Where the paired-client-device store lives.
+    #[arg(long, env = "DRAGONVNC_PAIRED_CLIENTS_PATH")]
+    paired_clients_path: Option<PathBuf>,
 }
 
 #[derive(clap::Subcommand)]
@@ -84,16 +95,16 @@ enum ClientsAction {
 #[derive(Parser)]
 struct ProbeSessionArgs {
     /// Initial mode, `WIDTHxHEIGHT[@SCALE]` (scale defaults to 1.0).
-    #[arg(long, default_value = "1920x1080")]
+    #[arg(long, env = "DRAGONVNC_MODE", default_value = "1920x1080")]
     mode: String,
 
     /// The user's real sway config to build the headless overlay from.
-    #[arg(long, default_value_os_t = default_sway_config_path())]
+    #[arg(long, env = "DRAGONVNC_SWAY_CONFIG", default_value_os_t = default_sway_config_path())]
     sway_config: PathBuf,
 
     /// The `sway-session` wrapper to launch through (must forward args to
     /// `sway` — see `dragonvnc-session`'s module doc).
-    #[arg(long, default_value_os_t = default_sway_session_path())]
+    #[arg(long, env = "DRAGONVNC_SWAY_SESSION", default_value_os_t = default_sway_session_path())]
     sway_session: PathBuf,
 }
 
@@ -118,70 +129,74 @@ fn default_runtime_dir() -> PathBuf {
 #[derive(Parser)]
 struct RunArgs {
     /// Address to listen on.
-    #[arg(long, default_value = "0.0.0.0:5900")]
+    #[arg(long, env = "DRAGONVNC_BIND", default_value = "0.0.0.0:5900")]
     bind: SocketAddr,
 
     /// Where to persist the server's long-term identity across restarts.
-    #[arg(long)]
+    #[arg(long, env = "DRAGONVNC_IDENTITY_PATH")]
     identity_path: Option<PathBuf>,
+
+    /// Where the paired-client-device store lives.
+    #[arg(long, env = "DRAGONVNC_PAIRED_CLIENTS_PATH")]
+    paired_clients_path: Option<PathBuf>,
 
     /// Which capture backend to run. `session` spawns a dedicated headless
     /// sway session per connection (see PLAN-headless-session.md);
     /// `test-pattern` uses a synthetic moving gradient with no session or
     /// compositor at all, for exercising the rest of the pipeline without a
     /// real display or GPU.
-    #[arg(long, value_enum, default_value_t = Source::Session)]
+    #[arg(long, value_enum, env = "DRAGONVNC_SOURCE", default_value_t = Source::Session)]
     source: Source,
 
     /// Test-pattern resolution (only used with --source test-pattern; real
     /// capture follows the client's reported viewport, or --mode).
-    #[arg(long, default_value_t = 1280)]
+    #[arg(long, env = "DRAGONVNC_WIDTH", default_value_t = 1280)]
     width: u32,
-    #[arg(long, default_value_t = 720)]
+    #[arg(long, env = "DRAGONVNC_HEIGHT", default_value_t = 720)]
     height: u32,
 
     /// Encoder tuning hint (rate control timebase, GOP length) and the
     /// screencopy capture-request rate cap.
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, env = "DRAGONVNC_FPS", default_value_t = 30)]
     fps: u32,
 
     /// Which encoder to feed captured frames through.
-    #[arg(long, value_enum, default_value_t = Codec::Passthrough)]
+    #[arg(long, value_enum, env = "DRAGONVNC_CODEC", default_value_t = Codec::Passthrough)]
     codec: Codec,
 
     /// VAAPI render node to encode on (only used with --codec vaapi-hevc).
     #[cfg(target_os = "linux")]
-    #[arg(long, default_value = dragonvnc_codec::vaapi::DEFAULT_DEVICE)]
+    #[arg(long, env = "DRAGONVNC_VAAPI_DEVICE", default_value = dragonvnc_codec::vaapi::DEFAULT_DEVICE)]
     vaapi_device: String,
 
     /// Target bitrate in bits/sec (only used with --codec vaapi-hevc).
-    #[arg(long, default_value_t = 4_000_000)]
+    #[arg(long, env = "DRAGONVNC_BITRATE", default_value_t = 4_000_000)]
     bitrate: i64,
 
     /// Fixed `WIDTHxHEIGHT[@SCALE]` override — pins the resolution instead
     /// of following the client's reported viewport; `RequestMode` is then
     /// ignored (the client is expected to letterbox) rather than honoured.
     /// Only meaningful with `--source session`.
-    #[arg(long)]
+    #[arg(long, env = "DRAGONVNC_MODE")]
     mode: Option<String>,
 
     /// xkb `options` string the virtual keyboard's keymap is compiled with
     /// (only used with --source session). Defaults to this box's Right
     /// Alt/Right Ctrl remaps — see PLAN-headless-session.md item 3.
     #[cfg(target_os = "linux")]
-    #[arg(long, default_value = "lv3:ralt_switch,lv5:rctrl_switch")]
+    #[arg(long, env = "DRAGONVNC_XKB_OPTIONS", default_value = "lv3:ralt_switch,lv5:rctrl_switch")]
     xkb_options: String,
 
     /// The user's real sway config to build each session's headless
     /// overlay from (only used with --source session).
     #[cfg(target_os = "linux")]
-    #[arg(long, default_value_os_t = default_sway_config_path())]
+    #[arg(long, env = "DRAGONVNC_SWAY_CONFIG", default_value_os_t = default_sway_config_path())]
     sway_config: PathBuf,
 
     /// The `sway-session` wrapper to launch sessions through (only used
     /// with --source session).
     #[cfg(target_os = "linux")]
-    #[arg(long, default_value_os_t = default_sway_session_path())]
+    #[arg(long, env = "DRAGONVNC_SWAY_SESSION", default_value_os_t = default_sway_session_path())]
     sway_session: PathBuf,
 
     /// Lines in the user's sway config matching this regex are dropped from
@@ -189,7 +204,7 @@ struct RunArgs {
     /// `dragonvnc_session`'s module doc for why `exec swayidle`/`exec
     /// lxpolkit` are the default.
     #[cfg(target_os = "linux")]
-    #[arg(long, default_value = r"^\s*exec\s+(swayidle|lxpolkit)(?:\s|$)")]
+    #[arg(long, env = "DRAGONVNC_EXEC_FILTER", default_value = r"^\s*exec\s+(swayidle|lxpolkit)(?:\s|$)")]
     exec_filter: String,
 }
 
@@ -242,10 +257,10 @@ fn parse_fingerprint_hex(s: &str) -> anyhow::Result<dragonvnc_net::Fingerprint> 
         .map_err(|v: Vec<u8>| anyhow::anyhow!("expected a 32-byte (64 hex char) fingerprint, got {} bytes", v.len()))
 }
 
-fn clients_command(action: ClientsAction) -> anyhow::Result<()> {
-    let path = default_paired_clients_path();
+fn clients_command(args: ClientsArgs) -> anyhow::Result<()> {
+    let path = args.paired_clients_path.unwrap_or_else(default_paired_clients_path);
     let mut store = PairedClients::load_from(&path)?;
-    match action {
+    match args.action {
         ClientsAction::List => {
             let mut any = false;
             for fp in store.list() {
@@ -283,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(target_os = "linux")]
         Command::ProbeSession(args) => probe_session(args).await,
-        Command::Clients(args) => clients_command(args.action),
+        Command::Clients(args) => clients_command(args),
     }
 }
 
@@ -577,7 +592,7 @@ async fn handle_connection(
     // ⇒ run the real ceremony and pin it on success.
     let peer_fingerprint = dragonvnc_net::identity::peer_fingerprint(&connection)
         .ok_or_else(|| anyhow::anyhow!("client presented no certificate — client auth is mandatory"))?;
-    let paired_clients_path = default_paired_clients_path();
+    let paired_clients_path = args.paired_clients_path.clone().unwrap_or_else(default_paired_clients_path);
     let mut paired_clients = PairedClients::load_from(&paired_clients_path)?;
     if paired_clients.is_paired(&peer_fingerprint) {
         tracing::info!(fingerprint = %hex(&peer_fingerprint), "known client, skipping pairing ceremony");
