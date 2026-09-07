@@ -510,8 +510,8 @@ async fn make_source(
 fn make_injector(
     args: &RunArgs,
     #[cfg(target_os = "linux")] wayland_socket: Option<&std::path::Path>,
-    width: u32,
-    height: u32,
+    #[cfg(target_os = "linux")] width: u32,
+    #[cfg(target_os = "linux")] height: u32,
 ) -> anyhow::Result<Box<dyn InputInjector>> {
     match args.source {
         Source::TestPattern => Ok(Box::new(dragonvnc_input::LoggingInjector)),
@@ -532,11 +532,11 @@ fn make_injector(
 
 fn make_encoder(
     codec: Codec,
-    width: u32,
-    height: u32,
-    fps: u32,
-    bitrate: i64,
-    src_format: dragonvnc_capture::PixelFormat,
+    #[cfg(target_os = "linux")] width: u32,
+    #[cfg(target_os = "linux")] height: u32,
+    #[cfg(target_os = "linux")] fps: u32,
+    #[cfg(target_os = "linux")] bitrate: i64,
+    #[cfg(target_os = "linux")] src_format: dragonvnc_capture::PixelFormat,
     #[cfg(target_os = "linux")] vaapi_device: &str,
 ) -> anyhow::Result<Box<dyn dragonvnc_codec::Encoder>> {
     match codec {
@@ -605,6 +605,11 @@ async fn handle_connection(
     );
     tracing::info!(%client_name, ?viewport, "client said hello");
 
+    // Only meaningful for `--source session` (Linux-only): sizes the
+    // headless compositor before capture starts. Nothing on other
+    // platforms consumes it yet — there's no real capture backend there to
+    // size.
+    #[cfg(target_os = "linux")]
     let initial_viewport = clamp_viewport(args.codec, fixed_mode.unwrap_or(viewport));
 
     // Only ever `Some` for `--source session` — spawned before capture
@@ -673,7 +678,9 @@ async fn handle_connection(
             &args,
             #[cfg(target_os = "linux")]
             wayland_socket_path.as_deref(),
+            #[cfg(target_os = "linux")]
             first_frame.info.width,
+            #[cfg(target_os = "linux")]
             first_frame.info.height,
         )?;
 
@@ -694,10 +701,15 @@ async fn handle_connection(
 
         let mut encoder = make_encoder(
             args.codec,
+            #[cfg(target_os = "linux")]
             first_frame.info.width,
+            #[cfg(target_os = "linux")]
             first_frame.info.height,
+            #[cfg(target_os = "linux")]
             args.fps,
+            #[cfg(target_os = "linux")]
             args.bitrate,
+            #[cfg(target_os = "linux")]
             first_frame.info.format,
             #[cfg(target_os = "linux")]
             &args.vaapi_device,
@@ -781,7 +793,9 @@ async fn handle_connection(
         // Tracked separately from each frame so a resize's encoder rebuild
         // still knows the source format even though, by then, `pending_frame`
         // has long since been consumed — see the loop body below, which keeps
-        // this updated from every frame actually captured.
+        // this updated from every frame actually captured. Only `make_encoder`
+        // (Linux-only construction) ever reads this.
+        #[cfg(target_os = "linux")]
         let mut src_format = first_frame.info.format;
         let mut pending_frame = Some(first_frame);
         let mut stats_window_started = Instant::now();
@@ -814,10 +828,15 @@ async fn handle_connection(
                     }
                     match make_encoder(
                         args.codec,
+                        #[cfg(target_os = "linux")]
                         new_viewport.width,
+                        #[cfg(target_os = "linux")]
                         new_viewport.height,
+                        #[cfg(target_os = "linux")]
                         args.fps,
+                        #[cfg(target_os = "linux")]
                         args.bitrate,
+                        #[cfg(target_os = "linux")]
                         src_format,
                         #[cfg(target_os = "linux")]
                         &args.vaapi_device,
@@ -837,7 +856,10 @@ async fn handle_connection(
                             break 'outer;
                         }
                     };
-                    src_format = frame.info.format;
+                    #[cfg(target_os = "linux")]
+                    {
+                        src_format = frame.info.format;
+                    }
 
                     let encode_started = Instant::now();
                     let encoded_frames = encoder.encode(&frame)?;
