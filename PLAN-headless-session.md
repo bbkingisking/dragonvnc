@@ -285,7 +285,7 @@ is refused; pinned client connects with no pairing stream; a client
 presenting a different cert with the same claimed name is refused. Then live
 from the Mac: first connect pairs, second connect shows no code prompt.
 
-### 6. Deployment on this box
+### 6. Deployment on this box — done (2026-09-07)
 
 - `~/.config/systemd/user/dragonvnc-server.service`: `ExecStart=%h/.cargo/bin/dragonvnc-server run --codec vaapi-hevc …`,
   `Restart=on-failure`, `Environment=RUST_LOG=info`. **No** `WAYLAND_DISPLAY`
@@ -294,10 +294,19 @@ from the Mac: first connect pairs, second connect shows no code prompt.
   with nobody logged in at the greeter. Note for the record: the physical
   greetd session keeps working exactly as before; the two compositors share
   the GPU through separate render-node handles.
-- `desktop-setup` repo: `sway-session` gets `exec sway "$@"`; CLAUDE.md there
-  gets a "Remote access (dragonvnc)" section mirroring the wayvnc one.
+- `desktop-setup` repo: `sway-session` gets `exec sway "$@"` (done as part of
+  item 1, verified live there); CLAUDE.md there gets a "Remote access
+  (dragonvnc)" section mirroring the wayvnc one.
 - Port: UDP 5900 does not clash with wayvnc's TCP 5900; leave it.
 - Pairing code: `journalctl --user -u dragonvnc-server -g 'pairing code'`.
+
+Verified live: `cargo install --path crates/dragonvnc-server` (release
+build), unit enabled + started, `systemctl --user status` shows
+`active (running)`; a genuinely stale process from before this milestone
+(the old `--source pipewire` build) was squatting UDP 5900 — killed (with
+explicit go-ahead) so the new unit could bind it. A real client connected
+through the deployed service end to end (pairing, ~6 Mbps HEVC stream,
+clean session teardown after disconnect).
 
 ### 7. Client (macOS) — minimal, done last
 
