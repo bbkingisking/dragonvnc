@@ -56,6 +56,42 @@ struct Handshake {
     ctrl_recv: quinn::RecvStream,
 }
 
+/// Best-effort graceful shutdown on Ctrl+C: without this, the process just
+/// dies on the spot (SIGINT's default disposition) and the QUIC connection
+/// vanishes with no close frame ever sent — the server has no way to tell
+/// that from a real network drop, so it waits out the full
+/// `max_idle_timeout` (15s) before noticing and freeing the "one session"
+/// slot. Found live (2026-09-07): reconnecting right after a Ctrl+C'd
+/// client hit exactly that, refused as busy for the whole 15s.
+///
+/// Registering `tokio::signal::ctrl_c()` overrides SIGINT's default
+/// disposition, so this task *is* what makes the process exit from here on
+/// — hence the explicit `std::process::exit` at the end, unconditionally.
+///
+/// Tested live (2026-09-07) and, per the user's own call, not chased
+/// further than this first attempt: `connection.close()` + awaiting
+/// `connection.closed()` does resolve quickly on the client side (well
+/// under even a generous 3s wait tried during testing), but the server
+/// never actually noticed — it still fell back to the full 15s
+/// `max_idle_timeout` every time. Local resolution of `closed()` reflects
+/// QUIC's closing/draining state machine locally (it doesn't wait for the
+/// peer to ack), which is evidently not the same thing as the
+/// CONNECTION_CLOSE frame actually having reached the server's socket
+/// before this process exits. Left in anyway — it's harmless and free, and
+/// might still help in conditions this testing didn't cover — but don't
+/// assume it actually shortens the server's reconnect-refusal window; today
+/// it doesn't, measurably.
+fn spawn_ctrl_c_graceful_close(connection: quinn::Connection) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("received Ctrl+C, closing the connection gracefully (best effort)");
+            connection.close(0u32.into(), b"client exiting");
+            let _ = tokio::time::timeout(Duration::from_millis(200), connection.closed()).await;
+        }
+        std::process::exit(0);
+    });
+}
+
 async fn connect_and_handshake(addr: SocketAddr, code: PairingCode, viewport: Viewport) -> anyhow::Result<Handshake> {
     let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
     let client_identity = load_client_identity()?;
@@ -117,6 +153,7 @@ pub async fn run_dump_raw(addr: SocketAddr, code: PairingCode, dump_path: PathBu
     // fixed size is enough since nothing here actually renders at it.
     let viewport = Viewport { width: 1920, height: 1080, scale: 1.0 };
     let hs = connect_and_handshake(addr, code, viewport).await?;
+    spawn_ctrl_c_graceful_close(hs.connection.clone());
     drop(hs.ctrl_recv); // control stream unused in this path
     let mut video_recv = hs.connection.accept_uni().await?;
     let mut dump_file = std::fs::File::create(dump_path)?;
@@ -178,6 +215,7 @@ pub async fn run_windowed(
         };
         let hs = connect_and_handshake(addr, code, initial_viewport).await?;
         let Handshake { connection, mut ctrl_send, ctrl_recv } = hs;
+        spawn_ctrl_c_graceful_close(connection.clone());
         drop(ctrl_recv); // nothing more expected from the server on this stream
 
         if let Some((x, y)) = move_to {
