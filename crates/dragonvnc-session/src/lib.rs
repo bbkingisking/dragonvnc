@@ -98,9 +98,17 @@ pub struct SessionOptions {
     /// `exec` line can invoke `session-ready` inside the spawned session.
     pub dragonvnc_server_bin: PathBuf,
     /// Lines in the user's config matching this are dropped from the
-    /// overlay rather than copied in verbatim. Default matches `exec
-    /// swayidle` (see module doc on why: `swaymsg output * power off` in the
-    /// headless session would stop the output rendering and stall capture).
+    /// overlay rather than copied in verbatim. Default matches two lines
+    /// that don't make sense in a per-connection headless session: `exec
+    /// swayidle` (`swaymsg output * power off` in the headless session
+    /// would stop the output rendering and stall capture) and `exec
+    /// lxpolkit` (found live, 2026-09-07: it registers as *the* PolicyKit
+    /// authentication agent on the system bus, which is shared and
+    /// singular regardless of this session's own private D-Bus session
+    /// bus — it collides with the physical session's already-registered
+    /// agent and fails loudly with a GDBus error on every connection; a
+    /// throwaway remote-login session has no business prompting for
+    /// privilege escalation anyway, same reasoning as swayidle's lock).
     pub exec_filter: regex::Regex,
     /// DRM render node wlroots' headless backend renders on
     /// (`WLR_RENDER_DRM_DEVICE`) — same GPU the VAAPI encoder uses.
@@ -133,7 +141,10 @@ impl SessionOptions {
 }
 
 pub fn default_exec_filter() -> regex::Regex {
-    regex::Regex::new(r"^\s*exec\s+swayidle").expect("static regex is valid")
+    // `(?:\s|$)` rather than `\b`: `\b` only requires a transition between a
+    // word/non-word character, which "-" already satisfies — matching
+    // "exec lxpolkit-lookalike" too, not just the real command.
+    regex::Regex::new(r"^\s*exec\s+(swayidle|lxpolkit)(?:\s|$)").expect("static regex is valid")
 }
 
 /// A running headless sway session spawned for exactly one connection.
@@ -471,12 +482,15 @@ mod tests {
     }
 
     #[test]
-    fn default_exec_filter_matches_swayidle_but_not_other_exec_lines() {
+    fn default_exec_filter_matches_swayidle_and_lxpolkit_but_not_other_exec_lines() {
         let re = default_exec_filter();
         assert!(re.is_match("exec swayidle -w timeout 7200 'swaylock -f'"));
         assert!(re.is_match("    exec swayidle -w timeout 1 x")); // leading whitespace
+        assert!(re.is_match("exec lxpolkit"));
+        assert!(re.is_match("    exec lxpolkit")); // leading whitespace
         assert!(!re.is_match("exec waybar"));
         assert!(!re.is_match("exec_always swayidle-lookalike"));
+        assert!(!re.is_match("exec lxpolkit-lookalike"));
     }
 
     #[tokio::test]

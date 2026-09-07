@@ -387,16 +387,29 @@ error, and a live resize hits that from both directions:
   now gets its own private bus. Regression test:
   `ghostty_opens_in_the_headless_session_even_with_another_instance_running_elsewhere`.
   **Still shared** (a private session bus doesn't touch these): `systemd
-  --user` itself, PipeWire, gnome-keyring. Apps in the remote session that
-  go through `xdg-desktop-portal` may now activate a *fresh* portal instance
-  on their own private bus (untested) rather than definitely reaching the
-  physical one as before — behavior here is genuinely unverified either way,
-  not a settled fact; treat portal-dependent apps (file choosers in
-  sandboxed apps, screen sharing) as unreliable in the remote session until
-  someone checks. Do **not** run `dbus-update-activation-environment --systemd
-  WAYLAND_DISPLAY` from the headless session regardless; it would still
-  repoint the physical session's *own* activated services at the remote
-  display if it ever reached the shared bus.
+  --user` itself, PipeWire, gnome-keyring. Confirmed live (2026-09-07,
+  launching Firefox in a session with the fix): `xdg-desktop-portal`
+  activates a *fresh* instance on the private bus rather than reaching the
+  physical one — no longer an open question. Do **not** run
+  `dbus-update-activation-environment --systemd WAYLAND_DISPLAY` from the
+  headless session regardless; it would still repoint the physical
+  session's *own* activated services at the remote display if it ever
+  reached the shared bus (sway itself already tries this at startup — seen
+  live failing harmlessly against the private bus, since `org.freedesktop.
+  systemd1` isn't registered there).
+  - **Follow-on found the same day**: the private bus fix changed
+    `lxpolkit`'s behavior — it used to self-exit ("already running") on a
+    session-bus name conflict with the physical instance, which incidentally
+    meant it never got far enough to hit a *second*, worse conflict:
+    registering as *the* PolicyKit authentication agent, which happens on
+    the **system bus** (shared and singular — a private session bus doesn't
+    touch it) and collides with the physical session's already-registered
+    agent, producing a `GDBus.Error:org.freedesktop.PolicyKit1.Error.Failed:
+    An authentication agent already exists for the given subject` window on
+    every connection. `exec lxpolkit` is now filtered out of the headless
+    overlay by default, same as `exec swayidle` and for the same reasoning:
+    a throwaway per-connection remote-login session has no business
+    prompting for privilege escalation anyway.
 - Audio from the remote session plays on the box's real speakers (shared
   PipeWire, unaffected by the D-Bus fix above). Remote audio is future work.
 - No Xwayland (not installed on this box). Wayland-native apps only.

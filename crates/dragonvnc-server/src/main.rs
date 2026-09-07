@@ -186,10 +186,10 @@ struct RunArgs {
 
     /// Lines in the user's sway config matching this regex are dropped from
     /// each session's overlay (only used with --source session) — see
-    /// `dragonvnc_session`'s module doc for why `exec swayidle` is the
-    /// default.
+    /// `dragonvnc_session`'s module doc for why `exec swayidle`/`exec
+    /// lxpolkit` are the default.
     #[cfg(target_os = "linux")]
-    #[arg(long, default_value = r"^\s*exec\s+swayidle")]
+    #[arg(long, default_value = r"^\s*exec\s+(swayidle|lxpolkit)(?:\s|$)")]
     exec_filter: String,
 }
 
