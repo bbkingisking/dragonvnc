@@ -1161,6 +1161,95 @@ mod live_input_tests {
         session.stop().await.unwrap();
     }
 
+    /// Finds a live sway socket that is NOT the one belonging to `exclude` —
+    /// i.e. some *other* sway instance already running on this box (in
+    /// practice: the physical seat0 session). Probes each candidate with a
+    /// real IPC call rather than just listing files, since a stale socket
+    /// path can linger after its sway process is long gone.
+    async fn other_live_sway_socket(exclude: &std::path::Path) -> Option<PathBuf> {
+        let entries = std::fs::read_dir("/run/user/1000").ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("sway-ipc.") || !name.ends_with(".sock") || path == exclude {
+                continue;
+            }
+            let ok = tokio::process::Command::new("swaymsg")
+                .arg("-s")
+                .arg(&path)
+                .args(["-t", "get_version"])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Reproduces a real bug found live (2026-09-07, testing item 7 against
+    /// a real macOS client): ghostty is a single-instance GTK `GApplication`
+    /// — launching it a second time doesn't start a new process, it asks
+    /// whichever instance is *already running* (over the D-Bus session
+    /// bus, which this headless session shares with the physical one — a
+    /// sharing this plan's "Known limitations" already called out, just not
+    /// through this specific service) to open a new window. That instance
+    /// is still connected to whatever Wayland display it originally
+    /// started on, so the new window lands there — not in the headless
+    /// session `$mod+Return` was pressed in — and typing into the (window-
+    /// less) headless session goes nowhere. Skips itself if there's no
+    /// other live sway to test against (e.g. running outside this box).
+    #[tokio::test]
+    #[ignore]
+    async fn ghostty_already_running_on_another_sway_opens_its_window_there_not_here() {
+        let session = start_probe_session(1280, 720).await;
+        let Some(other_sock) = other_live_sway_socket(session.sway_socket()).await else {
+            eprintln!("no other live sway instance on this box — skipping (nothing to reproduce against)");
+            session.stop().await.unwrap();
+            return;
+        };
+
+        // Make sure a ghostty instance is already running against the
+        // *other* (not-this-test's) compositor before we ever touch the
+        // headless one — this is the precondition the bug needs.
+        let _ = tokio::process::Command::new("swaymsg")
+            .arg("-s")
+            .arg(&other_sock)
+            .args(["exec", "ghostty"])
+            .status()
+            .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let other_tree_before = swaymsg_json(&other_sock, &["-t", "get_tree"]).await.to_string();
+        assert!(
+            other_tree_before.contains("ghostty"),
+            "precondition failed: couldn't get a live ghostty window on the other compositor to begin with"
+        );
+
+        // Now launch ghostty in the *headless* session — same as `$mod+Return` would.
+        let _ = tokio::process::Command::new("swaymsg")
+            .arg("-s")
+            .arg(session.sway_socket())
+            .args(["exec", "ghostty"])
+            .status()
+            .await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let headless_tree = swaymsg_json(session.sway_socket(), &["-t", "get_tree"]).await.to_string();
+        let headless_has_ghostty = headless_tree.contains("ghostty");
+
+        session.stop().await.unwrap();
+
+        assert!(
+            !headless_has_ghostty,
+            "expected the bug to reproduce (no new ghostty window in the headless session) — \
+             it didn't: a ghostty window showed up in the headless tree even with another \
+             instance already running elsewhere. Either the bug is fixed, or something about \
+             this reproduction no longer holds — check both before assuming success."
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn pointer_button_reaches_the_compositor() {
