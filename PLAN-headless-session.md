@@ -345,6 +345,15 @@ from the Mac: first connect pairs, second connect shows no code prompt.
   client is the credential.
 - Single user (`hafez`) hard-coded by "runs as the user". Multi-user needs
   the root broker (below).
+- Per-connection teardown (killing/hung `dragonvnc-server`, `Drop`) is
+  covered, but the server process itself dying ungracefully (`kill`/crash,
+  not a clean shutdown) is not: found live while testing item 4 — SIGTERMing
+  the server mid-connection leaves its active session's scope running
+  indefinitely, since nothing tells systemd to stop it once the parent
+  process is just gone (a systemd scope's lifetime isn't tied to its
+  launcher's). `systemctl --user stop 'dragonvnc-session-*'` cleans up by
+  hand meanwhile; a real fix is a `SIGTERM`/`SIGINT` handler that stops the
+  active session before the process exits, deferred as follow-up.
 
 ## Future work (out of this milestone, planned for)
 

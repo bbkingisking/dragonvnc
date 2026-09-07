@@ -11,11 +11,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::watch;
 use winit::event_loop::EventLoopProxy;
 
 use dragonvnc_codec::Decoder;
 use dragonvnc_net::{endpoint, pairing::PairingCode};
-use dragonvnc_proto::{ControlMessage, FrameHeader, InputEvent, PointerButton, VideoCodec, PROTOCOL_VERSION};
+use dragonvnc_proto::{ControlMessage, FrameHeader, InputEvent, PointerButton, VideoCodec, Viewport, PROTOCOL_VERSION};
 
 use crate::render::RenderEvent;
 
@@ -39,7 +40,7 @@ struct Handshake {
     ctrl_recv: quinn::RecvStream,
 }
 
-async fn connect_and_handshake(addr: SocketAddr, code: PairingCode) -> anyhow::Result<Handshake> {
+async fn connect_and_handshake(addr: SocketAddr, code: PairingCode, viewport: Viewport) -> anyhow::Result<Handshake> {
     let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
     let ep = endpoint::client_endpoint_for_pairing(bind_addr)?;
     let connection = ep.connect(addr, "dragonvnc")?.await?;
@@ -59,7 +60,7 @@ async fn connect_and_handshake(addr: SocketAddr, code: PairingCode) -> anyhow::R
     let (mut ctrl_send, mut ctrl_recv) = connection.open_bi().await?;
     send_msg(
         &mut ctrl_send,
-        &ControlMessage::Hello { protocol_version: PROTOCOL_VERSION, client_name: "dragonvnc-client".into() },
+        &ControlMessage::Hello { protocol_version: PROTOCOL_VERSION, client_name: "dragonvnc-client".into(), viewport },
     )
     .await?;
     let welcome: ControlMessage = recv_msg(&mut ctrl_recv).await?;
@@ -74,7 +75,10 @@ async fn connect_and_handshake(addr: SocketAddr, code: PairingCode) -> anyhow::R
 /// Headless path for `--dump-raw`: no window, no decoder, just write every
 /// payload to a file for inspection with an independent tool.
 pub async fn run_dump_raw(addr: SocketAddr, code: PairingCode, dump_path: PathBuf) -> anyhow::Result<()> {
-    let hs = connect_and_handshake(addr, code).await?;
+    // No window in this path, so no real viewport to report — a plausible
+    // fixed size is enough since nothing here actually renders at it.
+    let viewport = Viewport { width: 1920, height: 1080, scale: 1.0 };
+    let hs = connect_and_handshake(addr, code, viewport).await?;
     drop(hs.ctrl_recv); // control stream unused in this path
     let mut video_recv = hs.connection.accept_uni().await?;
     let mut dump_file = std::fs::File::create(dump_path)?;
@@ -120,9 +124,21 @@ pub async fn run_windowed(
     move_to: Option<(f32, f32)>,
     proxy: EventLoopProxy<RenderEvent>,
     mut input_rx: UnboundedReceiver<InputEvent>,
+    mut viewport_rx: watch::Receiver<Option<Viewport>>,
 ) {
     let result: anyhow::Result<()> = async {
-        let hs = connect_and_handshake(addr, code).await?;
+        // The window reports its real size/scale as soon as it's created
+        // (see `render::App::resumed`) — wait for that first value rather
+        // than guessing, so Hello carries the actual viewport and the
+        // headless session (if any) starts at the right size with no
+        // wrong-size flash.
+        let initial_viewport = loop {
+            if let Some(v) = *viewport_rx.borrow_and_update() {
+                break v;
+            }
+            viewport_rx.changed().await?;
+        };
+        let hs = connect_and_handshake(addr, code, initial_viewport).await?;
         let Handshake { connection, mut ctrl_send, ctrl_recv } = hs;
         drop(ctrl_recv); // nothing more expected from the server on this stream
 
@@ -142,20 +158,51 @@ pub async fn run_windowed(
         }
 
         // Input-forwarding task: relays window events (from the render
-        // thread, over `input_rx`) to the server. Runs independently of
-        // the video-decode loop below so neither can block the other.
+        // thread, over `input_rx`) and viewport changes (window resizes /
+        // scale-factor changes, over `viewport_rx`) to the server. Runs
+        // independently of the video-decode loop below so neither can
+        // block the other. `viewport_rx` already only ever holds the
+        // latest size (a `watch` channel), so rapid resize events coalesce
+        // here for free; the server debounces its side too (see
+        // PLAN-headless-session.md item 4).
         let input_task = tokio::spawn(async move {
             let mut sent_count = 0u64;
-            while let Some(event) = input_rx.recv().await {
-                tracing::trace!(?event, "forwarding input event");
-                if let Err(e) = send_msg(&mut ctrl_send, &ControlMessage::Input(event)).await {
-                    // Not silent: if input stops working while video is
-                    // still arriving (or vice versa), this is the log line
-                    // that tells you which side actually died first.
-                    tracing::info!(error = %e, sent_count, "control stream ended, stopping input forwarding");
-                    break;
+            // The initial value was already consumed (via `borrow_and_update`,
+            // into Hello) before this task started, so `changed()` below
+            // only fires on genuinely later updates.
+            loop {
+                tokio::select! {
+                    biased;
+                    event = input_rx.recv() => {
+                        let Some(event) = event else {
+                            tracing::info!(sent_count, "render thread gone, stopping input forwarding");
+                            break;
+                        };
+                        tracing::trace!(?event, "forwarding input event");
+                        if let Err(e) = send_msg(&mut ctrl_send, &ControlMessage::Input(event)).await {
+                            // Not silent: if input stops working while video
+                            // is still arriving (or vice versa), this is the
+                            // log line that tells you which side actually
+                            // died first.
+                            tracing::info!(error = %e, sent_count, "control stream ended, stopping input forwarding");
+                            break;
+                        }
+                        sent_count += 1;
+                    }
+                    changed = viewport_rx.changed() => {
+                        if changed.is_err() {
+                            // Render thread/App gone — window closing, the
+                            // input branch above will notice shortly too.
+                            continue;
+                        }
+                        let Some(v) = *viewport_rx.borrow_and_update() else { continue };
+                        let msg = ControlMessage::RequestMode { display_id: 0, width: v.width, height: v.height, refresh_hz: 0, scale: v.scale };
+                        if let Err(e) = send_msg(&mut ctrl_send, &msg).await {
+                            tracing::info!(error = %e, "control stream ended, stopping input forwarding");
+                            break;
+                        }
+                    }
                 }
-                sent_count += 1;
             }
         });
 

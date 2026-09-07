@@ -24,7 +24,15 @@
 //! extension (this box's reference `sway` does); it's a wlroots-specific
 //! protocol, not a generic Wayland one, so this module simply won't find
 //! the global on a non-wlroots compositor — see `new()`'s error.
+//!
+//! Connects to a specific Wayland socket passed in explicitly, not the
+//! process's own `WAYLAND_DISPLAY` — this server has no display of its own
+//! in its environment and mustn't need one; it targets whichever headless
+//! sway session it spawned for this connection (see
+//! PLAN-headless-session.md item 3).
 
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -83,13 +91,15 @@ pub struct WlrPointer {
 
 impl WlrPointer {
     /// `width`/`height` become the `x_extent`/`y_extent` every
-    /// `motion_absolute` call is made against — fixed for this object's
-    /// lifetime, same as the encoder and the keyboard injector: a
-    /// resolution change needs a new one, built from the next connection's
-    /// first captured frame.
-    pub fn new(width: u32, height: u32) -> anyhow::Result<Self> {
-        let conn = Connection::connect_to_env()
-            .map_err(|e| anyhow::anyhow!("connecting to the Wayland display failed: {e}"))?;
+    /// `motion_absolute` call is made against — updated later via
+    /// `set_extents` on a live resize (`RequestMode`), so this doesn't need
+    /// to be rebuilt when the display does.
+    pub fn new(wayland_socket_path: &Path, width: u32, height: u32) -> anyhow::Result<Self> {
+        let stream = UnixStream::connect(wayland_socket_path).map_err(|e| {
+            anyhow::anyhow!("connecting to Wayland socket {}: {e}", wayland_socket_path.display())
+        })?;
+        let conn = Connection::from_socket(stream)
+            .map_err(|e| anyhow::anyhow!("wayland connection handshake failed: {e}"))?;
         let display = conn.display();
         let mut queue = conn.new_event_queue::<RegistryState>();
         let qh = queue.handle();
@@ -113,6 +123,11 @@ impl WlrPointer {
 
     fn time_ms(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
+    }
+
+    pub fn set_extents(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
     }
 }
 

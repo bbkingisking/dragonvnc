@@ -1,9 +1,10 @@
-//! Screen capture abstraction. Real backends: PipeWire/portal on Linux (this
-//! module's `pipewire` submodule); ScreenCaptureKit on macOS and a DRM/KMS
-//! fallback for headless Linux are still the next milestone — see
-//! DESIGN.md "Status". This crate defines the trait boundary everything
-//! else builds against, plus a synthetic source for exercising the rest of
-//! the pipeline without real display hardware.
+//! Screen capture abstraction. Real backend on Linux: `zwlr_screencopy_manager_v1`
+//! against a specific headless sway session's Wayland socket (this module's
+//! `screencopy` submodule — see PLAN-headless-session.md item 2);
+//! ScreenCaptureKit on macOS is still the next milestone — see DESIGN.md
+//! "Status". This crate defines the trait boundary everything else builds
+//! against, plus a synthetic source for exercising the rest of the pipeline
+//! without real display hardware.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -114,7 +115,7 @@ impl FrameSource for TestPatternSource {
 }
 
 #[cfg(target_os = "linux")]
-pub mod pipewire;
+pub mod screencopy;
 
 #[cfg(test)]
 mod tests {

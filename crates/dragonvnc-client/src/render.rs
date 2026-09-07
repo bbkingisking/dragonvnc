@@ -10,13 +10,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dragonvnc_capture::PixelFormat;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
-use dragonvnc_proto::{InputEvent, PointerButton};
+use dragonvnc_proto::{InputEvent, PointerButton, Viewport};
 
 use crate::keymap;
 
@@ -96,13 +97,29 @@ struct GraphicsState {
 pub struct App {
     gfx: Option<GraphicsState>,
     input_tx: UnboundedSender<InputEvent>,
+    /// Reports the window's physical size + scale factor to the network
+    /// task: the initial value feeds `Hello`'s `viewport` (the network task
+    /// waits for it before connecting — see `network::run_windowed`), later
+    /// updates (`Resized`/`ScaleFactorChanged`) become `RequestMode`s. A
+    /// `watch` channel is exactly the right shape here: only the latest
+    /// size ever matters, same reasoning as the video-frame channels this
+    /// crate already uses elsewhere.
+    viewport_tx: watch::Sender<Option<Viewport>>,
     remote_size: Option<(u32, u32)>,
     last_error: Option<String>,
 }
 
 impl App {
-    pub fn new(input_tx: UnboundedSender<InputEvent>) -> Self {
-        Self { gfx: None, input_tx, remote_size: None, last_error: None }
+    pub fn new(input_tx: UnboundedSender<InputEvent>, viewport_tx: watch::Sender<Option<Viewport>>) -> Self {
+        Self { gfx: None, input_tx, viewport_tx, remote_size: None, last_error: None }
+    }
+
+    fn send_viewport(&self, physical_size: winit::dpi::PhysicalSize<u32>, scale_factor: f64) {
+        let _ = self.viewport_tx.send(Some(Viewport {
+            width: physical_size.width,
+            height: physical_size.height,
+            scale: scale_factor as f32,
+        }));
     }
 
     fn send_input(&self, event: InputEvent) {
@@ -241,6 +258,8 @@ impl ApplicationHandler<RenderEvent> for App {
         let pipeline_rgba = make_pipeline(&device, &pipeline_layout, &shader, surface_format);
         let pipeline_bgra = make_pipeline(&device, &pipeline_layout, &shader, surface_format);
 
+        self.send_viewport(size, window.scale_factor());
+
         self.gfx = Some(GraphicsState {
             surface,
             device,
@@ -330,6 +349,13 @@ impl ApplicationHandler<RenderEvent> for App {
                     gfx.config.width = size.width.max(1);
                     gfx.config.height = size.height.max(1);
                     gfx.surface.configure(&gfx.device, &gfx.config);
+                    let scale_factor = gfx.window.scale_factor();
+                    self.send_viewport(size, scale_factor);
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(gfx) = &self.gfx {
+                    self.send_viewport(gfx.window.inner_size(), scale_factor);
                 }
             }
             WindowEvent::RedrawRequested => {

@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::<render::RenderEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (viewport_tx, viewport_rx) = tokio::sync::watch::channel(None);
 
     let addr = args.addr;
     let move_to = args.move_to;
@@ -97,10 +98,10 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
         };
-        rt.block_on(network::run_windowed(addr, code, move_to, proxy, input_rx));
+        rt.block_on(network::run_windowed(addr, code, move_to, proxy, input_rx, viewport_rx));
     })?;
 
-    let mut app = render::App::new(input_tx);
+    let mut app = render::App::new(input_tx, viewport_tx);
     event_loop.run_app(&mut app)?;
     Ok(())
 }

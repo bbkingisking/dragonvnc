@@ -15,7 +15,16 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// QUIC application-level close code for "a session is already active" —
+/// this server model is one session, one client (see
+/// PLAN-headless-session.md item 4): a second connection while one is live
+/// is refused with this code before pairing even starts, so a stranger
+/// can't burn the pairing code trying. Carried as the numeric close code on
+/// `Connection::close`, not a `ControlMessage` — the connection never gets
+/// far enough to open a control stream.
+pub const CLOSE_CODE_BUSY: u32 = 1;
 
 /// Sanity cap for any length-prefixed read on the wire — pairing frames,
 /// control messages, frame headers, and encoded video-frame payloads alike.
@@ -56,6 +65,10 @@ pub enum ControlMessage {
     Hello {
         protocol_version: u32,
         client_name: String,
+        /// The client's on-screen viewport at connect time — sizes the
+        /// headless display before the first frame, so there's no
+        /// wrong-size flash and no second negotiation round trip.
+        viewport: Viewport,
     },
     /// Server's reply: what it can offer.
     Welcome {
@@ -64,12 +77,15 @@ pub enum ControlMessage {
         displays: Vec<DisplayInfo>,
     },
     /// Ask the server to change the streamed resolution/refresh rate for a
-    /// display (dynamic resize).
+    /// display (dynamic resize). Ignored (answered with the fixed mode
+    /// instead — the client letterboxes) when the server was started with a
+    /// `--mode` override.
     RequestMode {
         display_id: u32,
         width: u32,
         height: u32,
         refresh_hz: u32,
+        scale: f32,
     },
     Input(InputEvent),
     ClipboardUpdate {
@@ -159,13 +175,15 @@ mod tests {
         let msg = ControlMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             client_name: "test-client".into(),
+            viewport: Viewport { width: 1920, height: 1080, scale: 1.0 },
         };
         let bytes = encode(&msg).unwrap();
         let back: ControlMessage = decode(&bytes).unwrap();
         match back {
-            ControlMessage::Hello { protocol_version, client_name } => {
+            ControlMessage::Hello { protocol_version, client_name, viewport } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(client_name, "test-client");
+                assert_eq!(viewport, Viewport { width: 1920, height: 1080, scale: 1.0 });
             }
             _ => panic!("wrong variant"),
         }

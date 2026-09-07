@@ -26,6 +26,17 @@ use crate::{EncodedFrame, Encoder};
 /// `/dev/dri/renderD*` rather than hardcoding it.
 pub const DEFAULT_DEVICE: &str = "/dev/dri/renderD128";
 
+/// VCN 2.2's HEVC encoder's verified resolution range on this GPU (see
+/// DESIGN.md and this module's tests): `avcodec_open2` fails EINVAL below
+/// `MIN_WIDTH`x`MIN_HEIGHT`; `MAX_WIDTH`x`MAX_HEIGHT` is the other end.
+/// Callers driving a live-resizable source (e.g. a headless compositor
+/// output) should clamp to this range before requesting a mode change —
+/// this crate only enforces it implicitly, by `avcodec_open2` failing.
+pub const MIN_WIDTH: u32 = 130;
+pub const MIN_HEIGHT: u32 = 128;
+pub const MAX_WIDTH: u32 = 8192;
+pub const MAX_HEIGHT: u32 = 4352;
+
 fn av_pixel_format(format: PixelFormat) -> ff::AVPixelFormat {
     match format {
         PixelFormat::Rgba => ff::AVPixelFormat::AV_PIX_FMT_RGBA,

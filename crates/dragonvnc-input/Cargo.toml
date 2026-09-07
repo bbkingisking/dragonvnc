@@ -11,6 +11,8 @@ tracing.workspace = true
 async-trait = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-input-linux = "0.7"
+rustix = { version = "1", features = ["fs", "mm"] }
 wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkbcommon = "0.9"
